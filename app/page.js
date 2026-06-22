@@ -5,17 +5,13 @@ import { supabase } from './lib/supabase'
 import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 
 // ─── API CONFIG ───────────────────────────────────────────────
-const API = 'https://69f6e61bd9bdaee24ae46336--soilappnet.netlify.app'
 const LOCAL_ADMIN_EMAIL = process.env.NEXT_PUBLIC_LOCAL_ADMIN_EMAIL || 'admin@soil.com'
 const LOCAL_ADMIN_PASSWORD = process.env.NEXT_PUBLIC_LOCAL_ADMIN_PASSWORD || 'Soil@123'
-const isLocalhost = () => typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname)
-
-const apiFetch = async (path, opts = {}) => {
-  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) }
-  const res = await fetch(`${API}/api/${path}`, { ...opts, headers })
-  const text = await res.text()
-  try { return JSON.parse(text) } catch { return text }
-}
+const isAdminFallbackEnabled = () => typeof window !== 'undefined' && [
+  'localhost',
+  '127.0.0.1',
+  'soilappnet.netlify.app',
+].includes(window.location.hostname)
 
 const adminFetch = async (action, table, id, data = null, field = null, value = null) => {
   const res = await fetch('/.netlify/functions/invoice-admin', {
@@ -23,7 +19,62 @@ const adminFetch = async (action, table, id, data = null, field = null, value = 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action, table, id, data, field, value }),
   })
-  return res.json()
+  const json = await res.json()
+  if (!res.ok || (json && !Array.isArray(json) && json.error)) {
+    throw new Error(json?.error?.message || json?.error || json?.message || 'Database request failed')
+  }
+  return json
+}
+
+const API_RESOURCES = {
+  products: { table: 'products', select: '*', order: 'created_at.desc' },
+  categories: { table: 'product_categories', select: '*', order: 'name.asc' },
+  customers: { table: 'customers', select: '*', order: 'created_at.desc' },
+  orders: { table: 'orders', select: '*,customers(name)', order: 'created_at.desc' },
+  payments: { table: 'payments', select: '*,customers(name),invoices(invoice_number)', order: 'created_at.desc' },
+  inventory: { table: 'inventory', select: '*,products(name,product_code,mrp,unit)', order: 'created_at.desc' },
+  states: { table: 'states', select: '*', order: 'name.asc' },
+  districts: { table: 'districts', select: '*', order: 'name.asc' },
+  blocks: { table: 'blocks', select: '*', order: 'name.asc' },
+  villages: { table: 'villages', select: '*', order: 'name.asc' },
+  gram_panchayats: { table: 'gram_panchayats', select: '*', order: 'name.asc' },
+  invoices: { table: 'invoices', select: '*,customers(*),states(name),districts(name),blocks(name)', order: 'created_at.desc' },
+}
+
+const cleanDbPayload = value => Object.fromEntries(
+  Object.entries(value || {})
+    .filter(([key, val]) => !['id', 'created_at', 'updated_at'].includes(key) && (val === null || typeof val !== 'object') && val !== undefined)
+    .map(([key, val]) => [key, key.endsWith('_id') && val === '' ? null : val])
+)
+
+const apiFetch = async (path, opts = {}) => {
+  const [resource, id] = path.split('/')
+  const config = API_RESOURCES[resource]
+  if (!config) throw new Error(`Unsupported API resource: ${resource}`)
+
+  const method = (opts.method || 'GET').toUpperCase()
+  if (method === 'GET') {
+    let select = config.select
+    if (resource === 'invoices' && id) select = '*,customers(*),states(name),districts(name),blocks(name),invoice_items(*,products(*))'
+    const qs = [`select=${select}`, id ? `id=eq.${id}` : '', config.order ? `order=${config.order}` : '', id ? 'limit=1' : '']
+      .filter(Boolean).join('&')
+    const rows = await adminFetch('select', config.table, null, { qs })
+    return id ? rows?.[0] || null : rows
+  }
+
+  const payload = cleanDbPayload(typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body)
+  if (method === 'POST') {
+    if (resource === 'payments' && !payload.payment_number) payload.payment_number = `PAY-${Date.now()}`
+    const rows = await adminFetch('insert', config.table, null, payload)
+    return Array.isArray(rows) ? rows[0] : rows
+  }
+  if (!id) throw new Error(`${method} requires a record id`)
+  if (method === 'PUT' || method === 'PATCH') {
+    const rows = await adminFetch('update', config.table, id, payload)
+    return Array.isArray(rows) ? rows[0] : rows
+  }
+  if (method === 'DELETE') return adminFetch('delete', config.table, id)
+  throw new Error(`Unsupported request method: ${method}`)
 }
 
 // ─── UTILS ────────────────────────────────────────────────────
@@ -127,7 +178,7 @@ export default function App() {
     try {
       const [p, cat, cust, ord, inv, pay, invnt, st, dist, bl, vil, panch, pu] = await Promise.all([
         apiFetch('products'), apiFetch('categories'), apiFetch('customers'),
-        apiFetch('orders'), adminFetch('list', 'invoices'), apiFetch('payments'),
+        apiFetch('orders'), apiFetch('invoices'), apiFetch('payments'),
         apiFetch('inventory'), apiFetch('states'), apiFetch('districts'),
         apiFetch('blocks'), apiFetch('villages'), apiFetch('gram_panchayats'),
         adminFetch('select', 'users', null, { qs: 'select=*,states(name),districts(name),blocks(name)&order=created_at.desc' }),
@@ -169,7 +220,7 @@ export default function App() {
   const login = async (email, pass) => {
     setSaving(true)
     try {
-      if (isLocalhost() && email.trim().toLowerCase() === LOCAL_ADMIN_EMAIL.toLowerCase() && pass === LOCAL_ADMIN_PASSWORD) {
+      if (isAdminFallbackEnabled() && email.trim().toLowerCase() === LOCAL_ADMIN_EMAIL.toLowerCase() && pass === LOCAL_ADMIN_PASSWORD) {
         const localAdmin = {
           id: 'local-super-admin',
           first_name: 'Local',
@@ -453,7 +504,14 @@ export default function App() {
     try {
       if (!d.first_name || !d.email || !d.password) { setErr('Name, email and password are required'); setSaving(false); return }
       // Step 1: Create auth user
-      const created = await apiFetch('auth/signup', { method: 'POST', body: JSON.stringify({ first_name: d.first_name, last_name: d.last_name || '', email: d.email, phone: d.phone || '', password: d.password, role: d.role || 'marketing_executive' }) })
+      const created = await adminFetch('create_user', null, null, {
+        first_name: d.first_name,
+        last_name: d.last_name || '',
+        email: d.email,
+        phone: d.phone || '',
+        password: d.password,
+        role: d.role || 'marketing_executive',
+      })
       const newUser = created?.user || created
       if (!newUser?.id) { setErr(newUser?.message || newUser?.error || 'User creation failed'); setSaving(false); return }
       const userId = newUser.id
@@ -494,6 +552,12 @@ export default function App() {
       await loadAll(); closeModal()
     } catch (e) { setErr(e.message) }
     setSaving(false)
+  }
+  const delPayment = async (id) => {
+    try {
+      await apiFetch(`payments/${id}`, { method: 'DELETE' })
+      await loadAll()
+    } catch (e) { alert('Payment delete failed: ' + e.message) }
   }
 
   // ── LOCATIONS ──
@@ -592,7 +656,7 @@ export default function App() {
           {tab === 'customers' && <RenderCustomers customers={customers} openModal={openModal} askDel={askDel} delCust={delCust} />}
           {tab === 'orders' && <RenderOrders orders={orders} customers={customers} products={products} filter={orderFilter} setFilter={setOrderFilter} openModal={openModal} askDel={askDel} delOrder={delOrder} setOItems={setOItems} openEditOrder={openEditOrder} />}
           {tab === 'invoices' && <RenderInvoices invoices={invoices} filter={invFilter} setFilter={setInvFilter} openModal={openModal} askDel={askDel} delInvoice={delInvoice} printInvoice={printInvoice} />}
-          {tab === 'payments' && <RenderPayments payments={payments} openModal={openModal} />}
+          {tab === 'payments' && <RenderPayments payments={payments} openModal={openModal} askDel={askDel} delPayment={delPayment} />}
           {tab === 'inventory' && <RenderInventory inventory={inventory} invTab={invTab} setInvTab={setInvTab} openModal={openModal} />}
           {tab === 'reports' && <RenderReports orders={orders} payments={payments} period={reportPeriod} setPeriod={setReportPeriod} />}
           {tab === 'executives' && <RenderExecutives portalUsers={portalUsers} user={user} states={states} districts={districts} blocks={blocks} panchayats={panchayats} villages={villages} openModal={openModal} askDel={askDel} deletePortalUser={deletePortalUser} />}
@@ -887,7 +951,7 @@ function RenderInvoices({ invoices, filter, setFilter, openModal, askDel, delInv
 }
 
 // ─── PAYMENTS ─────────────────────────────────────────────────
-function RenderPayments({ payments, openModal }) {
+function RenderPayments({ payments, openModal, askDel, delPayment }) {
   const total = payments.reduce((s, p) => s + Number(p.amount || 0), 0)
   return (
     <div className="space-y-4">
@@ -898,7 +962,7 @@ function RenderPayments({ payments, openModal }) {
       <div className="bg-white rounded-xl border shadow-sm overflow-x-auto">
         <table className="w-full text-sm"><thead><tr className="bg-gray-50 text-xs text-gray-500 border-b">
           <th className="px-4 py-3 text-left">Payment #</th><th className="px-4 py-3 text-left">Invoice</th>
-          <th className="px-4 py-3 text-left">Customer</th><th className="px-4 py-3 text-left">Amount</th><th className="px-4 py-3 text-left">Mode</th><th className="px-4 py-3 text-left">Date</th>
+          <th className="px-4 py-3 text-left">Customer</th><th className="px-4 py-3 text-left">Amount</th><th className="px-4 py-3 text-left">Mode</th><th className="px-4 py-3 text-left">Date</th><th className="px-4 py-3 text-left">Actions</th>
         </tr></thead>
           <tbody>{payments.map(p => (
             <tr key={p.id} className="border-b hover:bg-gray-50">
@@ -908,8 +972,18 @@ function RenderPayments({ payments, openModal }) {
               <td className="px-4 py-3 font-semibold text-green-600">{cur(p.amount)}</td>
               <td className="px-4 py-3 capitalize text-gray-500">{p.payment_mode?.replace(/_/g, ' ')}</td>
               <td className="px-4 py-3 text-gray-500 text-xs">{fmtDate(p.payment_date || p.created_at)}</td>
+              <td className="px-4 py-3">
+                <button
+                  onClick={() => askDel(`Delete payment "${p.payment_number}" of ${cur(p.amount)}?`, () => delPayment(p.id))}
+                  className="px-2.5 py-1 text-xs bg-red-50 text-red-600 rounded-lg hover:bg-red-100 font-medium border border-red-100"
+                >
+                  Delete
+                </button>
+              </td>
             </tr>
-          ))}</tbody>
+          ))}
+          {payments.length === 0 && <tr><td colSpan={7} className="px-4 py-10 text-center text-gray-400">No payments found</td></tr>}
+          </tbody>
         </table>
       </div>
     </div>

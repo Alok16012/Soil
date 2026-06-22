@@ -25,7 +25,62 @@ exports.handler = async (event) => {
 
   try {
     let res, json
-    if (action === 'delete') {
+    if (action === 'create_user') {
+      const { email, password, first_name, last_name, phone, role } = data || {}
+      if (!email || !password || !first_name) {
+        return { statusCode: 400, headers, body: JSON.stringify({ error: 'Name, email and password are required' }) }
+      }
+      if (password.length < 6) {
+        return { statusCode: 400, headers, body: JSON.stringify({ error: 'Password must be at least 6 characters' }) }
+      }
+
+      const authRes = await fetch(`${SUPABASE_URL}/auth/v1/admin/users`, {
+        method: 'POST',
+        headers: {
+          apikey: SERVICE_KEY,
+          Authorization: `Bearer ${SERVICE_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          email: email.trim().toLowerCase(),
+          password,
+          email_confirm: true,
+          user_metadata: { first_name, last_name: last_name || '', phone: phone || '', role: role || 'marketing_executive' },
+        }),
+      })
+      const authText = await authRes.text()
+      const authJson = authText ? JSON.parse(authText) : {}
+      if (!authRes.ok) {
+        return { statusCode: authRes.status, headers, body: JSON.stringify({ error: authJson.msg || authJson.message || authJson.error_description || 'Auth user creation failed' }) }
+      }
+
+      const authUser = authJson.user || authJson
+      const profile = {
+        id: authUser.id,
+        email: email.trim().toLowerCase(),
+        first_name,
+        last_name: last_name || null,
+        phone: phone || null,
+        role: role || 'marketing_executive',
+        is_active: true,
+        is_verified: true,
+      }
+      const profileRes = await fetch(`${SUPABASE_URL}/rest/v1/users?on_conflict=id`, {
+        method: 'POST',
+        headers: { ...sbHeaders, Prefer: 'resolution=merge-duplicates,return=representation' },
+        body: JSON.stringify(profile),
+      })
+      const profileText = await profileRes.text()
+      const profileJson = profileText ? JSON.parse(profileText) : []
+      if (!profileRes.ok) {
+        await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${authUser.id}`, {
+          method: 'DELETE',
+          headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}` },
+        })
+        return { statusCode: profileRes.status, headers, body: JSON.stringify({ error: profileJson.message || 'User profile creation failed' }) }
+      }
+      json = { user: Array.isArray(profileJson) ? profileJson[0] : profileJson }
+    } else if (action === 'delete') {
       res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}`, { method: 'DELETE', headers: sbHeaders })
       json = res.ok ? { success: true } : await res.json()
     } else if (action === 'update') {
