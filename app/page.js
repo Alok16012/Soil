@@ -80,6 +80,24 @@ const apiFetch = async (path, opts = {}) => {
 // ─── UTILS ────────────────────────────────────────────────────
 const cur = n => '₹' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })
 const fmtDate = s => s ? new Date(s).toLocaleDateString('en-IN') : '-'
+const GST_RATES = [5, 12, 18, 28]
+const num = v => Number(v || 0)
+const fmtPct = v => `${Number(v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}%`
+const itemTaxRate = it => num(it.tax_rate ?? it.gst_rate ?? ((num(it.cgst_rate) + num(it.sgst_rate)) || 0))
+const splitGstRate = it => itemTaxRate(it) / 2
+const invoiceEffectiveGstRate = inv => num(inv?.subtotal) ? (num(inv?.tax_amount) / num(inv?.subtotal)) * 100 : 0
+const invoiceHalfGstRate = inv => invoiceEffectiveGstRate(inv) / 2
+const invoiceTaxLabel = (inv, items = []) => {
+  const rates = [...new Set((items || []).map(itemTaxRate).filter(r => r > 0).map(r => Number(r.toFixed(4))))]
+  if (rates.length > 1) return 'product-wise'
+  const rate = rates[0] ?? invoiceEffectiveGstRate(inv)
+  return rate ? fmtPct(rate / 2) : '0%'
+}
+const orderTaxSummary = order => {
+  const subtotal = num(order?.subtotal || (num(order?.total_amount) - num(order?.tax_amount)))
+  const tax = num(order?.tax_amount || (num(order?.total_amount) - subtotal))
+  return { subtotal, tax, cgst: tax / 2, sgst: tax / 2, total: subtotal + tax, rate: subtotal ? tax / subtotal * 100 : 0 }
+}
 const _ones = ['','One','Two','Three','Four','Five','Six','Seven','Eight','Nine','Ten','Eleven','Twelve','Thirteen','Fourteen','Fifteen','Sixteen','Seventeen','Eighteen','Nineteen']
 const _tens = ['','','Twenty','Thirty','Forty','Fifty','Sixty','Seventy','Eighty','Ninety']
 function _tw(n) {
@@ -369,12 +387,19 @@ export default function App() {
   const saveInvoice = async (d) => {
     setSaving(true)
     try {
-      const cgst = (d.subtotal || 0) * 0.09
-      const { customer_name: _cn, ...rest } = d
+      const selectedOrder = d.order_id ? orders.find(o => o.id === d.order_id) : null
+      const orderSummary = selectedOrder ? orderTaxSummary(selectedOrder) : null
+      const subtotal = orderSummary ? orderSummary.subtotal : num(d.subtotal)
+      const taxRate = orderSummary ? orderSummary.rate : num(d.gst_rate || 18)
+      const tax = orderSummary ? orderSummary.tax : subtotal * taxRate / 100
+      const cgst = tax / 2
+      const sgst = tax / 2
+      const { customer_name: _cn, gst_rate: _gst, tax_rate: _tr, ...rest } = d
       const payload = {
         ...rest,
-        cgst_amount: cgst, sgst_amount: cgst, tax_amount: cgst * 2,
-        total_amount: (d.subtotal || 0) + cgst * 2,
+        subtotal,
+        cgst_amount: cgst, sgst_amount: sgst, tax_amount: tax,
+        total_amount: subtotal + tax,
         order_id: rest.order_id || null,
         customer_id: rest.customer_id || null,
         state_id: rest.state_id || null,
@@ -414,19 +439,30 @@ export default function App() {
   const printInvoice = async (id) => {
     const inv = await apiFetch(`invoices/${id}`)
     const cust = inv.customers || {}
-    const items = inv.invoice_items || []
+    let items = inv.invoice_items || []
+    if ((!items || items.length === 0) && inv.order_id) {
+      const { data: orderItems } = await supabase.from('order_items').select('*, products(name,hsn_code,product_code,unit)').eq('order_id', inv.order_id)
+      items = orderItems || []
+    }
     const balance = (inv.total_amount||0)-(inv.paid_amount||0)
-    const rows = items.map((it,i) => `<tr style="background:${i%2?'#f9fafb':'#fff'}">
-      <td style="padding:6px 8px;color:#6b7280">${i+1}</td>
-      <td style="padding:6px 8px;font-weight:500">${it.products?.name||'-'}<br><span style="font-size:10px;color:#9ca3af">${it.products?.product_code||''}</span></td>
-      <td style="padding:6px 8px;color:#6b7280">${it.products?.hsn_code||it.hsn_code||'-'}</td>
-      <td style="padding:6px 8px;text-align:center">${it.quantity} ${it.unit||''}</td>
-      <td style="padding:6px 8px;text-align:right">${cur(it.rate)}</td>
-      <td style="padding:6px 8px;text-align:center">${it.cgst_rate||9}%</td>
-      <td style="padding:6px 8px;text-align:center">${it.sgst_rate||9}%</td>
-      <td style="padding:6px 8px;text-align:right">${cur((it.quantity||0)*(it.rate||0)-(it.discount_amount||0))}</td>
-      <td style="padding:6px 8px;text-align:right;font-weight:600">${cur(it.total_amount)}</td>
-    </tr>`).join('')
+    const halfTaxLabel = invoiceTaxLabel(inv, items)
+    const rows = items.map((it,i) => {
+      const rate = num(it.rate || it.unit_rate)
+      const taxable = num(it.total_amount || (it.quantity||0)*rate) - num(it.discount_amount)
+      const lineTax = num(it.tax_amount || taxable * itemTaxRate(it) / 100)
+      const halfRate = splitGstRate(it)
+      return `<tr style="background:${i%2?'#f9fafb':'#fff'}">
+        <td style="padding:6px 8px;color:#6b7280">${i+1}</td>
+        <td style="padding:6px 8px;font-weight:500">${it.products?.name||'-'}<br><span style="font-size:10px;color:#9ca3af">${it.products?.product_code||''}</span></td>
+        <td style="padding:6px 8px;color:#6b7280">${it.products?.hsn_code||it.hsn_code||'-'}</td>
+        <td style="padding:6px 8px;text-align:center">${it.quantity} ${it.products?.unit||it.unit||''}</td>
+        <td style="padding:6px 8px;text-align:right">${cur(rate)}</td>
+        <td style="padding:6px 8px;text-align:center">${fmtPct(halfRate)}</td>
+        <td style="padding:6px 8px;text-align:center">${fmtPct(halfRate)}</td>
+        <td style="padding:6px 8px;text-align:right">${cur(taxable)}</td>
+        <td style="padding:6px 8px;text-align:right;font-weight:600">${cur(taxable + lineTax)}</td>
+      </tr>`
+    }).join('')
     const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Invoice ${inv.invoice_number}</title>
     <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;font-size:13px;color:#1f2937;padding:24px}
     @media print{body{padding:12px}}</style></head><body>
@@ -476,8 +512,8 @@ export default function App() {
         <div style="width:220px;font-size:12px">
           <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #e5e7eb"><span style="color:#6b7280">Subtotal</span><span>${cur(inv.subtotal)}</span></div>
           ${(inv.discount_amount>0)?`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #e5e7eb;color:#dc2626"><span>Discount</span><span>- ${cur(inv.discount_amount)}</span></div>`:''}
-          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #e5e7eb"><span style="color:#6b7280">CGST (9%)</span><span>${cur(inv.cgst_amount)}</span></div>
-          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #e5e7eb"><span style="color:#6b7280">SGST (9%)</span><span>${cur(inv.sgst_amount)}</span></div>
+          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #e5e7eb"><span style="color:#6b7280">CGST (${halfTaxLabel})</span><span>${cur(inv.cgst_amount)}</span></div>
+          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #e5e7eb"><span style="color:#6b7280">SGST (${halfTaxLabel})</span><span>${cur(inv.sgst_amount)}</span></div>
           ${(inv.igst_amount>0)?`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #e5e7eb"><span style="color:#6b7280">IGST</span><span>${cur(inv.igst_amount)}</span></div>`:''}
           <div style="display:flex;justify-content:space-between;padding:8px 0;border-top:2px solid #1f2937;font-weight:700;font-size:14px"><span>Grand Total</span><span style="color:#15803d">${cur(inv.total_amount)}</span></div>
           ${(inv.paid_amount>0)?`<div style="display:flex;justify-content:space-between;padding:4px 0;color:#16a34a"><span>Amount Paid</span><span>${cur(inv.paid_amount)}</span></div>`:''}
@@ -1607,15 +1643,24 @@ function OrderDetail({ order }) {
 // ─── INVOICE FORM ─────────────────────────────────────────────
 function InvoiceForm({ data, orders, customers, states, districts, blocks, onSave, onCancel, saving }) {
   const isEdit = !!data?.id
-  const [f, setF] = useState(data ? { ...data } : { order_id: '', customer_id: '', subtotal: 0, payment_status: 'pending', invoice_date: new Date().toISOString().slice(0, 10), notes: '', state_id: '', district_id: '', block_id: '' })
+  const [f, setF] = useState(data ? { ...data, gst_rate: invoiceEffectiveGstRate(data) || 18 } : { order_id: '', customer_id: '', subtotal: 0, gst_rate: 18, payment_status: 'pending', invoice_date: new Date().toISOString().slice(0, 10), notes: '', state_id: '', district_id: '', block_id: '' })
   const set = (k, v) => setF(p => ({ ...p, [k]: v }))
   const selOrder = oid => {
+    if (!oid) { setF(p => ({ ...p, order_id: '', subtotal: 0 })); return }
     const o = orders.find(x => x.id === oid); if (!o) return
-    set('order_id', oid); set('customer_id', o.customer_id); set('subtotal', o.subtotal || o.total_amount || 0)
+    const t = orderTaxSummary(o)
+    setF(p => ({ ...p, order_id: oid, customer_id: o.customer_id, subtotal: t.subtotal, gst_rate: t.rate || p.gst_rate }))
   }
   const filteredDistricts = districts.filter(d => !f.state_id || d.state_id === f.state_id)
   const filteredBlocks = blocks.filter(b => !f.district_id || b.district_id === f.district_id)
-  const cgst = (f.subtotal || 0) * 0.09
+  const selectedOrder = f.order_id ? orders.find(o => o.id === f.order_id) : null
+  const orderSummary = selectedOrder ? orderTaxSummary(selectedOrder) : null
+  const previewSubtotal = orderSummary ? orderSummary.subtotal : num(f.subtotal)
+  const previewTaxRate = orderSummary ? orderSummary.rate : num(f.gst_rate || 18)
+  const previewTax = orderSummary ? orderSummary.tax : previewSubtotal * previewTaxRate / 100
+  const previewCgst = previewTax / 2
+  const previewSgst = previewTax / 2
+  const halfLabel = previewTaxRate ? fmtPct(previewTaxRate / 2) : '0%'
   return (
     <div className="space-y-4">
       {!isEdit && <FRow label="Link to Order"><select className={sel} value={f.order_id} onChange={e => selOrder(e.target.value)}><option value="">Select order (optional)...</option>{orders.map(o => <option key={o.id} value={o.id}>{o.order_number} — {o.customer_name || o.customers?.name}</option>)}</select></FRow>}
@@ -1639,13 +1684,19 @@ function InvoiceForm({ data, orders, customers, states, districts, blocks, onSav
         <FRow label="Invoice Date"><input className={inp} type="date" value={f.invoice_date || ''} onChange={e => set('invoice_date', e.target.value)} /></FRow>
         <FRow label="Payment Status"><select className={sel} value={f.payment_status} onChange={e => set('payment_status', e.target.value)}><option value="pending">Pending</option><option value="partial">Partial</option><option value="paid">Paid</option></select></FRow>
       </div>
-      {!isEdit && <FRow label="Subtotal (₹)"><input className={inp} type="number" value={f.subtotal} onChange={e => set('subtotal', Number(e.target.value))} /></FRow>}
-      {Number(f.subtotal) > 0 && (
+      {!isEdit && !f.order_id && (
+        <div className="grid grid-cols-2 gap-4">
+          <FRow label="Subtotal (₹)"><input className={inp} type="number" value={f.subtotal} onChange={e => set('subtotal', Number(e.target.value))} /></FRow>
+          <FRow label="GST Rate"><select className={sel} value={f.gst_rate} onChange={e => set('gst_rate', Number(e.target.value))}>{GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}</select></FRow>
+        </div>
+      )}
+      {f.order_id && <p className="text-xs text-blue-600 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">GST order ke product rates se calculate hoga. Effective GST: {fmtPct(previewTaxRate)}.</p>}
+      {previewSubtotal > 0 && (
         <div className="bg-blue-50 rounded-xl p-4 text-sm space-y-1">
-          <div className="flex justify-between"><span>Subtotal</span><span className="font-medium">{cur(f.subtotal)}</span></div>
-          <div className="flex justify-between"><span>CGST (9%)</span><span>{cur(cgst)}</span></div>
-          <div className="flex justify-between"><span>SGST (9%)</span><span>{cur(cgst)}</span></div>
-          <div className="flex justify-between font-bold border-t pt-1 text-base"><span>Total</span><span className="text-blue-700">{cur(Number(f.subtotal) + cgst * 2)}</span></div>
+          <div className="flex justify-between"><span>Subtotal</span><span className="font-medium">{cur(previewSubtotal)}</span></div>
+          <div className="flex justify-between"><span>CGST ({halfLabel})</span><span>{cur(previewCgst)}</span></div>
+          <div className="flex justify-between"><span>SGST ({halfLabel})</span><span>{cur(previewSgst)}</span></div>
+          <div className="flex justify-between font-bold border-t pt-1 text-base"><span>Total</span><span className="text-blue-700">{cur(previewSubtotal + previewTax)}</span></div>
         </div>
       )}
       <FRow label="Notes"><textarea className={inp} rows={2} value={f.notes || ''} onChange={e => set('notes', e.target.value)} /></FRow>
@@ -1689,6 +1740,7 @@ function InvoiceDetail({ invoice, user, onPrint }) {
   const cust = inv.customers || {}
   const balance = (inv.total_amount||0) - (inv.paid_amount||0)
   const levelParts = [inv.states?.name, inv.districts?.name, inv.blocks?.name].filter(Boolean)
+  const halfTaxLabel = invoiceTaxLabel(inv, items)
 
   return (
     <div className="text-sm border border-green-200 rounded-xl overflow-hidden">
@@ -1766,19 +1818,24 @@ function InvoiceDetail({ invoice, user, onPrint }) {
               <th className="px-3 py-2 text-right">Taxable</th>
               <th className="px-3 py-2 text-right">Total</th>
             </tr></thead>
-            <tbody>{items.map((it,i) => (
-              <tr key={it.id||i} className={i%2===0?'bg-white':'bg-gray-50'}>
-                <td className="px-3 py-2 text-gray-400">{i+1}</td>
-                <td className="px-3 py-2 font-medium">{it.products?.name||'-'}<br/><span className="text-gray-400 font-normal">{it.products?.product_code}</span></td>
-                <td className="px-3 py-2 text-gray-500">{it.products?.hsn_code||it.hsn_code||'-'}</td>
-                <td className="px-3 py-2 text-center">{it.quantity} {it.products?.unit||it.unit||''}</td>
-                <td className="px-3 py-2 text-right">{cur(it.rate||it.unit_rate)}</td>
-                <td className="px-3 py-2 text-center">{it.cgst_rate||9}%</td>
-                <td className="px-3 py-2 text-center">{it.sgst_rate||9}%</td>
-                <td className="px-3 py-2 text-right">{cur((it.quantity||0)*(it.rate||it.unit_rate||0))}</td>
-                <td className="px-3 py-2 text-right font-semibold">{cur(it.total_amount||(it.quantity||0)*(it.rate||it.unit_rate||0)*(1+(it.tax_rate||0)/100))}</td>
-              </tr>
-            ))}</tbody>
+            <tbody>{items.map((it,i) => {
+              const taxable = num(it.total_amount || (it.quantity||0)*(it.rate||it.unit_rate||0))
+              const lineTax = num(it.tax_amount || taxable * itemTaxRate(it) / 100)
+              const halfRate = splitGstRate(it)
+              return (
+                <tr key={it.id||i} className={i%2===0?'bg-white':'bg-gray-50'}>
+                  <td className="px-3 py-2 text-gray-400">{i+1}</td>
+                  <td className="px-3 py-2 font-medium">{it.products?.name||'-'}<br/><span className="text-gray-400 font-normal">{it.products?.product_code}</span></td>
+                  <td className="px-3 py-2 text-gray-500">{it.products?.hsn_code||it.hsn_code||'-'}</td>
+                  <td className="px-3 py-2 text-center">{it.quantity} {it.products?.unit||it.unit||''}</td>
+                  <td className="px-3 py-2 text-right">{cur(it.rate||it.unit_rate)}</td>
+                  <td className="px-3 py-2 text-center">{fmtPct(halfRate)}</td>
+                  <td className="px-3 py-2 text-center">{fmtPct(halfRate)}</td>
+                  <td className="px-3 py-2 text-right">{cur(taxable)}</td>
+                  <td className="px-3 py-2 text-right font-semibold">{cur(taxable + lineTax)}</td>
+                </tr>
+              )
+            })}</tbody>
           </table>
         </div>
       )}
@@ -1797,8 +1854,8 @@ function InvoiceDetail({ invoice, user, onPrint }) {
         <div className="w-52 text-xs space-y-0.5">
           <div className="flex justify-between py-1 border-b"><span className="text-gray-500">Subtotal</span><span>{cur(inv.subtotal)}</span></div>
           {(inv.discount_amount>0) && <div className="flex justify-between py-1 border-b text-red-600"><span>Discount</span><span>- {cur(inv.discount_amount)}</span></div>}
-          <div className="flex justify-between py-1 border-b"><span className="text-gray-500">CGST (9%)</span><span>{cur(inv.cgst_amount)}</span></div>
-          <div className="flex justify-between py-1 border-b"><span className="text-gray-500">SGST (9%)</span><span>{cur(inv.sgst_amount)}</span></div>
+          <div className="flex justify-between py-1 border-b"><span className="text-gray-500">CGST ({halfTaxLabel})</span><span>{cur(inv.cgst_amount)}</span></div>
+          <div className="flex justify-between py-1 border-b"><span className="text-gray-500">SGST ({halfTaxLabel})</span><span>{cur(inv.sgst_amount)}</span></div>
           {(inv.igst_amount>0) && <div className="flex justify-between py-1 border-b"><span className="text-gray-500">IGST</span><span>{cur(inv.igst_amount)}</span></div>}
           <div className="flex justify-between py-2 font-bold text-sm border-t-2 border-gray-700"><span>Grand Total</span><span className="text-green-700">{cur(inv.total_amount)}</span></div>
           {(inv.paid_amount>0) && <div className="flex justify-between py-1 text-green-600"><span>Paid</span><span>{cur(inv.paid_amount)}</span></div>}
