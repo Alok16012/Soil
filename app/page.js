@@ -562,10 +562,24 @@ export default function App() {
 
   // ── LOCATIONS ──
   const saveLocation = async (type, d) => {
+    setSaving(true)
     try {
-      await apiFetch(type, { method: 'POST', body: JSON.stringify(d) })
+      const payload = { ...d, name: (d.name || '').trim(), code: (d.code || '').trim(), is_active: d.is_active ?? true }
+      if (!payload.name) throw new Error('Location name is required')
+      if (type === 'districts' && !payload.state_id) throw new Error('Select state first')
+      if (type === 'blocks' && !payload.district_id) throw new Error('Select district first')
+      if (type === 'gram_panchayats' && !payload.block_id) throw new Error('Select block first')
+      if (type === 'villages' && !payload.gram_panchayat_id) throw new Error('Select gram panchayat first')
+      await apiFetch(type, { method: 'POST', body: JSON.stringify(payload) })
       await loadAll(); closeModal()
     } catch (e) { setErr(e.message) }
+    setSaving(false)
+  }
+  const delLocation = async (type, id) => {
+    try {
+      await apiFetch(`${type}/${id}`, { method: 'DELETE' })
+      await loadAll()
+    } catch (e) { alert('Location delete failed: ' + e.message) }
   }
 
   // ─── AUTH SCREEN ─────────────────────────────────────────
@@ -660,7 +674,7 @@ export default function App() {
           {tab === 'inventory' && <RenderInventory inventory={inventory} invTab={invTab} setInvTab={setInvTab} openModal={openModal} />}
           {tab === 'reports' && <RenderReports orders={orders} payments={payments} period={reportPeriod} setPeriod={setReportPeriod} />}
           {tab === 'executives' && <RenderExecutives portalUsers={portalUsers} user={user} states={states} districts={districts} blocks={blocks} panchayats={panchayats} villages={villages} openModal={openModal} askDel={askDel} deletePortalUser={deletePortalUser} />}
-          {tab === 'locations' && <RenderLocations states={states} districts={districts} blocks={blocks} villages={villages} openModal={openModal} />}
+          {tab === 'locations' && <RenderLocations states={states} districts={districts} blocks={blocks} panchayats={panchayats} villages={villages} openModal={openModal} askDel={askDel} delLocation={delLocation} />}
         </main>
       </div>
 
@@ -679,7 +693,7 @@ export default function App() {
                 {modal.type === 'invoiceDetail' && `Invoice: ${modal.data?.invoice_number}`}
                 {modal.type === 'payment' && 'Record Payment'}
                 {modal.type === 'executive' && 'Create Portal User'}
-                {modal.type === 'location' && `Add to ${modal.data?.locType}`}
+                {modal.type === 'location' && `Add ${modal.data?.label || 'Location'}`}
                 {modal.type === 'stockAdjust' && `Adjust Stock: ${modal.data?.products?.name}`}
               </h3>
               <button onClick={closeModal} className="text-gray-400 hover:text-gray-700 w-8 h-8 flex items-center justify-center rounded-lg hover:bg-gray-100 text-xl">✕</button>
@@ -695,7 +709,7 @@ export default function App() {
               {modal.type === 'invoiceDetail' && <InvoiceDetail invoice={modal.data} user={user} onPrint={() => { printInvoice(modal.data.id) }} />}
               {modal.type === 'payment' && <PaymentForm invoices={invoices} customers={customers} onSave={savePayment} onCancel={closeModal} saving={saving} />}
               {modal.type === 'executive' && <UserCreateForm states={states} districts={districts} blocks={blocks} panchayats={panchayats} villages={villages} onSave={saveAdminUser} onCancel={closeModal} saving={saving} />}
-              {modal.type === 'location' && <LocationForm locType={modal.data?.locType} fields={modal.data?.fields} onSave={saveLocation} onCancel={closeModal} />}
+              {modal.type === 'location' && <LocationForm locType={modal.data?.locType} fields={modal.data?.fields} initial={modal.data?.initial} onSave={saveLocation} onCancel={closeModal} saving={saving} />}
               {modal.type === 'stockAdjust' && <StockAdjustForm item={modal.data} onSave={adjustInventory} onCancel={closeModal} />}
             </div>
           </div>
@@ -1232,28 +1246,139 @@ function RenderExecutives({ portalUsers, user, states, districts, blocks, pancha
 }
 
 // ─── LOCATIONS ────────────────────────────────────────────────
-function RenderLocations({ states, districts, blocks, villages, openModal }) {
-  const locs = [
-    { key: 'states', l: 'States', items: states, fields: [{ n: 'name', l: 'State Name' }, { n: 'code', l: 'State Code' }] },
-    { key: 'districts', l: 'Districts', items: districts, fields: [{ n: 'name', l: 'District Name' }, { n: 'code', l: 'Code' }, { n: 'state_id', l: 'State', type: 'select', opts: states }] },
-    { key: 'blocks', l: 'Blocks', items: blocks.slice(0, 50), total: blocks.length, fields: [{ n: 'name', l: 'Block Name' }, { n: 'code', l: 'Code' }, { n: 'district_id', l: 'District', type: 'select', opts: districts }] },
-    { key: 'villages', l: 'Villages', items: villages.slice(0, 50), total: villages.length, fields: [{ n: 'name', l: 'Village Name' }, { n: 'code', l: 'Code' }] },
-  ]
+function RenderLocations({ states, districts, blocks, panchayats, villages, openModal, askDel, delLocation }) {
+  const [selState, setSelState] = useState('')
+  const [selDistrict, setSelDistrict] = useState('')
+  const [selBlock, setSelBlock] = useState('')
+  const [selPanchayat, setSelPanchayat] = useState('')
+
+  useEffect(() => {
+    if (!states.length) return
+    if (!selState || !states.some(s => s.id === selState)) setSelState(states[0].id)
+  }, [states, selState])
+  useEffect(() => {
+    const list = districts.filter(d => d.state_id === selState)
+    if (!list.some(d => d.id === selDistrict)) setSelDistrict(list[0]?.id || '')
+  }, [districts, selState, selDistrict])
+  useEffect(() => {
+    const list = blocks.filter(b => b.district_id === selDistrict)
+    if (!list.some(b => b.id === selBlock)) setSelBlock(list[0]?.id || '')
+  }, [blocks, selDistrict, selBlock])
+  useEffect(() => {
+    const list = panchayats.filter(p => p.block_id === selBlock)
+    if (!list.some(p => p.id === selPanchayat)) setSelPanchayat(list[0]?.id || '')
+  }, [panchayats, selBlock, selPanchayat])
+
+  const stateDistricts = districts.filter(d => d.state_id === selState)
+  const districtBlocks = blocks.filter(b => b.district_id === selDistrict)
+  const blockPanchayats = panchayats.filter(p => p.block_id === selBlock)
+  const blockPanchayatIds = new Set(blockPanchayats.map(p => p.id))
+  const blockVillages = villages.filter(v => blockPanchayatIds.has(v.gram_panchayat_id))
+  const panchayatVillages = villages.filter(v => v.gram_panchayat_id === selPanchayat)
+  const activeState = states.find(s => s.id === selState)
+  const activeDistrict = districts.find(d => d.id === selDistrict)
+  const activeBlock = blocks.find(b => b.id === selBlock)
+  const activePanchayat = panchayats.find(p => p.id === selPanchayat)
+
+  const addLocation = (locType, label, fields, initial = {}) => openModal('location', { locType, label, fields, initial })
+  const fields = {
+    states: [{ n: 'name', l: 'State Name', required: true }, { n: 'code', l: 'State Code' }, { n: 'gst_state_code', l: 'GST State Code' }],
+    districts: [{ n: 'state_id', l: 'State', type: 'select', opts: states, required: true }, { n: 'name', l: 'District Name', required: true }, { n: 'code', l: 'Code' }],
+    blocks: [{ n: 'district_id', l: 'District', type: 'select', opts: selState ? stateDistricts : districts, required: true }, { n: 'name', l: 'Block Name', required: true }, { n: 'code', l: 'Code' }],
+    gram_panchayats: [{ n: 'block_id', l: 'Block', type: 'select', opts: selDistrict ? districtBlocks : blocks, required: true }, { n: 'name', l: 'Gram Panchayat Name', required: true }, { n: 'code', l: 'Code' }],
+    villages: [{ n: 'gram_panchayat_id', l: 'Gram Panchayat', type: 'select', opts: selBlock ? blockPanchayats : panchayats, required: true }, { n: 'name', l: 'Village Name', required: true }, { n: 'code', l: 'Code' }],
+  }
+  const childText = (type, item) => {
+    if (type === 'states') {
+      const count = districts.filter(d => d.state_id === item.id).length
+      return count ? `${count} district pehle delete karo` : ''
+    }
+    if (type === 'districts') {
+      const count = blocks.filter(b => b.district_id === item.id).length
+      return count ? `${count} block pehle delete karo` : ''
+    }
+    if (type === 'blocks') {
+      const pCount = panchayats.filter(p => p.block_id === item.id).length
+      return pCount ? `${pCount} gram panchayat pehle delete karo` : ''
+    }
+    if (type === 'gram_panchayats') {
+      const count = villages.filter(v => v.gram_panchayat_id === item.id).length
+      return count ? `${count} village pehle delete karo` : ''
+    }
+    return ''
+  }
+  const requestDelete = (type, item, label) => {
+    const blocker = childText(type, item)
+    if (blocker) { alert(`${label} "${item.name}" delete nahi ho sakta — ${blocker}.`); return }
+    askDel(`Delete ${label} "${item.name}"?`, () => delLocation(type, item.id))
+  }
+  const ListCard = ({ title, count, items, selected, onSelect, onAdd, type, label, hint }) => (
+    <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 border-b bg-gray-50">
+        <div>
+          <h3 className="font-semibold text-sm text-gray-800">{title} <span className="text-gray-400 font-normal">({count})</span></h3>
+          {hint && <p className="text-[11px] text-gray-400 mt-0.5">{hint}</p>}
+        </div>
+        <button onClick={onAdd} className="text-xs bg-green-50 text-green-700 hover:bg-green-100 border border-green-100 rounded-lg px-2.5 py-1 font-medium">+ Add</button>
+      </div>
+      <div className="max-h-80 overflow-y-auto p-2 space-y-1">
+        {items.map(item => {
+          const isActive = selected === item.id
+          return (
+            <div key={item.id} className={`group rounded-lg border ${isActive ? 'border-green-300 bg-green-50' : 'border-transparent hover:bg-gray-50'}`}>
+              <button onClick={() => onSelect?.(item.id)} className="w-full text-left px-3 py-2">
+                <span className={`block text-sm font-medium ${isActive ? 'text-green-800' : 'text-gray-700'}`}>{item.name}</span>
+                <span className="text-[11px] text-gray-400">{item.code ? `Code: ${item.code}` : 'No code'}</span>
+              </button>
+              <div className="px-3 pb-2 flex justify-end">
+                <button onClick={() => requestDelete(type, item, label)} className="text-[11px] text-red-500 hover:text-red-700 hover:bg-red-50 rounded px-2 py-0.5">Delete</button>
+              </div>
+            </div>
+          )
+        })}
+        {items.length === 0 && <p className="text-xs text-gray-400 text-center py-8">No entries</p>}
+      </div>
+    </div>
+  )
+
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-      {locs.map(loc => (
-        <div key={loc.key} className="bg-white rounded-xl border shadow-sm">
-          <div className="flex items-center justify-between px-4 py-3 border-b">
-            <h3 className="font-medium text-sm">{loc.l} <span className="text-gray-400 font-normal">({loc.total || loc.items.length})</span></h3>
-            <button onClick={() => openModal('location', { locType: loc.key, fields: loc.fields })} className="text-xs text-green-600 hover:underline font-medium">+ Add</button>
-          </div>
-          <div className="p-3 max-h-48 overflow-y-auto divide-y">
-            {loc.items.map(i => <p key={i.id} className="py-1.5 text-sm text-gray-600">{i.name} {i.code ? <span className="text-xs text-gray-400">({i.code})</span> : ''}</p>)}
-            {loc.total > 50 && <p className="text-xs text-gray-400 py-2">... and {loc.total - 50} more</p>}
-            {loc.items.length === 0 && <p className="text-xs text-gray-400 py-2">No entries</p>}
+    <div className="space-y-4">
+      <div className="bg-white rounded-xl border shadow-sm p-4">
+        <p className="text-xs font-semibold uppercase tracking-widest text-green-700 mb-2">Location hierarchy</p>
+        <div className="text-sm text-gray-600 flex flex-wrap items-center gap-2">
+          <span>{activeState?.name || 'State'}</span><span className="text-gray-300">→</span>
+          <span>{activeDistrict?.name || 'District'}</span><span className="text-gray-300">→</span>
+          <span>{activeBlock?.name || 'Block'}</span><span className="text-gray-300">→</span>
+          <span>{activePanchayat?.name || 'Gram Panchayat'}</span><span className="text-gray-300">→</span>
+          <span>{panchayatVillages.length} village</span>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-5 gap-4">
+        <ListCard title="States" label="state" type="states" count={states.length} items={states} selected={selState} onSelect={id => { setSelState(id); setSelDistrict(''); setSelBlock(''); setSelPanchayat('') }} onAdd={() => addLocation('states', 'State', fields.states)} />
+        <ListCard title="Districts" label="district" type="districts" count={stateDistricts.length} items={stateDistricts} selected={selDistrict} onSelect={id => { setSelDistrict(id); setSelBlock(''); setSelPanchayat('') }} onAdd={() => addLocation('districts', 'District', fields.districts, { state_id: selState })} hint={activeState ? `Inside ${activeState.name}` : 'Select state'} />
+        <ListCard title="Blocks" label="block" type="blocks" count={districtBlocks.length} items={districtBlocks} selected={selBlock} onSelect={id => { setSelBlock(id); setSelPanchayat('') }} onAdd={() => addLocation('blocks', 'Block', fields.blocks, { district_id: selDistrict })} hint={activeDistrict ? `Inside ${activeDistrict.name}` : 'Select district'} />
+        <ListCard title="Gram Panchayats" label="gram panchayat" type="gram_panchayats" count={blockPanchayats.length} items={blockPanchayats} selected={selPanchayat} onSelect={setSelPanchayat} onAdd={() => addLocation('gram_panchayats', 'Gram Panchayat', fields.gram_panchayats, { block_id: selBlock })} hint={activeBlock ? `Inside ${activeBlock.name}` : 'Select block'} />
+        <ListCard title="Villages" label="village" type="villages" count={panchayatVillages.length || blockVillages.length} items={panchayatVillages.length ? panchayatVillages : blockVillages} selected="" onSelect={() => {}} onAdd={() => addLocation('villages', 'Village', fields.villages, { gram_panchayat_id: selPanchayat })} hint={activePanchayat ? `Inside ${activePanchayat.name}` : activeBlock ? `All villages in ${activeBlock.name}` : 'Select block'} />
+      </div>
+      {activeBlock && blockVillages.length > 0 && (
+        <div className="bg-white rounded-xl border shadow-sm p-4">
+          <h3 className="font-semibold text-sm text-gray-800 mb-3">Village list under {activeBlock.name}</h3>
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
+            {blockPanchayats.map(p => {
+              const rows = villages.filter(v => v.gram_panchayat_id === p.id)
+              if (!rows.length) return null
+              return (
+                <div key={p.id} className="border rounded-lg p-3 bg-gray-50">
+                  <p className="text-xs font-semibold text-gray-500 mb-2">{p.name}</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {rows.map(v => <span key={v.id} className="text-xs bg-white border rounded-full px-2 py-1 text-gray-600">{v.name}</span>)}
+                  </div>
+                </div>
+              )
+            })}
           </div>
         </div>
-      ))}
+      )}
     </div>
   )
 }
@@ -1840,20 +1965,26 @@ function UserCreateForm({ states, districts, blocks, panchayats, villages, onSav
 }
 
 // ─── LOCATION FORM ────────────────────────────────────────────
-function LocationForm({ locType, fields, onSave, onCancel }) {
-  const [f, setF] = useState({})
+function LocationForm({ locType, fields, initial, onSave, onCancel, saving }) {
+  const [f, setF] = useState(initial || {})
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }))
   return (
     <div className="space-y-4">
       {fields?.map(field => (
-        <FRow key={field.n} label={field.l}>
+        <FRow key={field.n} label={field.l} required={field.required}>
           {field.type === 'select'
-            ? <select className={sel} value={f[field.n] || ''} onChange={e => setF(p => ({ ...p, [field.n]: e.target.value }))}><option value="">Select...</option>{field.opts?.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}</select>
-            : <input className={inp} value={f[field.n] || ''} onChange={e => setF(p => ({ ...p, [field.n]: e.target.value }))} />}
+            ? <select className={sel} value={f[field.n] || ''} onChange={e => set(field.n, e.target.value)}><option value="">Select...</option>{field.opts?.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}</select>
+            : <input className={inp} value={f[field.n] || ''} onChange={e => set(field.n, e.target.value)} />}
         </FRow>
       ))}
+      {locType === 'villages' && (
+        <p className="text-xs text-gray-500 bg-gray-50 border rounded-lg px-3 py-2">
+          Village DB me Gram Panchayat ke under save hota hai. Block-wise list screen par automatically group ho jayegi.
+        </p>
+      )}
       <div className="flex justify-end gap-3 pt-2">
         <button onClick={onCancel} className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50">Cancel</button>
-        <button onClick={() => onSave(locType, f)} className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700">Add</button>
+        <button onClick={() => onSave(locType, f)} disabled={saving} className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-60">{saving ? 'Saving...' : 'Add'}</button>
       </div>
     </div>
   )
