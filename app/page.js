@@ -156,6 +156,11 @@ const CHART_COLORS = ['#16a34a','#2563eb','#d97706','#dc2626','#7c3aed']
 export default function App() {
   const [user, setUser] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [authMode, setAuthMode] = useState('login')
+  const [recovery, setRecovery] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [toast, setToast] = useState('')
+  const showToast = msg => { setToast(msg); setTimeout(() => setToast(''), 4000) }
   const [tab, setTab] = useState('dashboard')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [searchQ, setSearchQ] = useState('')
@@ -219,6 +224,10 @@ export default function App() {
   }
 
   useEffect(() => {
+    // Password reset links land here with tokens in the URL hash; read it before supabase clears it
+    const hash = new URLSearchParams(window.location.hash.slice(1))
+    if (hash.get('type') === 'recovery') setRecovery(true)
+    if (hash.get('error_code')) setErr(hash.get('error_code') === 'otp_expired' ? 'Reset link expire ho gaya. Dobara "Forgot password" karein.' : (hash.get('error_description') || 'Link invalid hai'))
     supabase.auth.getSession().then(async ({ data: { session } }) => {
       const profile = await loadProfile(session)
       if (profile) setUser(profile)
@@ -227,6 +236,7 @@ export default function App() {
     })
     const { data: sub } = supabase.auth.onAuthStateChange((event) => {
       if (event === 'SIGNED_OUT') setUser(null)
+      if (event === 'PASSWORD_RECOVERY') setRecovery(true)
     })
     return () => sub.subscription.unsubscribe()
   }, [])
@@ -254,12 +264,37 @@ export default function App() {
       if (!profile) {
         await supabase.auth.signOut()
         setErr('Account inactive hai ya profile nahi mila. Admin se contact karein.')
-      } else { setUser(profile); setTab('dashboard'); setErr('') }
+      } else { setUser(profile); setTab('dashboard'); setErr(''); setNotice('') }
     } catch { setErr('Login failed. Please try again.') }
     setSaving(false)
   }
 
   const logout = async () => { await supabase.auth.signOut(); setUser(null) }
+
+  const sendResetLink = async (email) => {
+    if (!email?.trim()) { setErr('Email daalein'); return }
+    setSaving(true); setErr('')
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), { redirectTo: `${window.location.origin}/` })
+    setSaving(false)
+    if (error && error.status === 429) { setErr('Bahut zyada requests. Thodi der baad try karein, ya admin se password reset karwayein.'); return }
+    // Same message whether or not the account exists
+    setNotice('Agar ye email registered hai to password reset link bhej diya gaya hai. Inbox (aur spam) check karein.')
+    setAuthMode('login')
+  }
+
+  const setNewPassword = async (pass, confirmPass) => {
+    if ((pass || '').length < 6) { setErr('Password kam se kam 6 characters ka ho'); return }
+    if (pass !== confirmPass) { setErr('Dono password match nahi kar rahe'); return }
+    setSaving(true); setErr('')
+    const { data, error } = await supabase.auth.updateUser({ password: pass })
+    if (error) { setErr(error.message); setSaving(false); return }
+    const { data: { session } } = await supabase.auth.getSession()
+    const profile = await loadProfile(session || { user: data.user })
+    setRecovery(false); setSaving(false)
+    window.history.replaceState(null, '', window.location.pathname)
+    if (profile) { setUser(profile); setTab('dashboard') }
+    else { await supabase.auth.signOut(); setNotice('Password set ho gaya, lekin account inactive hai. Admin se contact karein.') }
+  }
 
   const openModal = (type, data = null) => { setModal({ type, data }); setErr('') }
   const closeModal = () => { setModal(null); setErr(''); setSaving(false) }
@@ -530,28 +565,30 @@ export default function App() {
   const saveAdminUser = async (d) => {
     setSaving(true)
     try {
-      if (!d.first_name || !d.email || !d.password) { setErr('Name, email and password are required'); setSaving(false); return }
-      // Step 1: Create auth user
-      const created = await adminFetch('create_user', null, null, {
-        first_name: d.first_name,
-        last_name: d.last_name || '',
-        email: d.email,
-        phone: d.phone || '',
-        password: d.password,
+      const isEdit = !!d.id
+      if (!d.first_name?.trim() || !d.email) { setErr('Name and email are required'); setSaving(false); return }
+      if (!isEdit && (d.password || '').length < 6) { setErr('Password must be at least 6 characters'); setSaving(false); return }
+      const core = {
+        first_name: d.first_name.trim(), last_name: d.last_name || '', phone: d.phone || '',
         role: d.role || 'marketing_executive',
-      })
-      const newUser = created?.user || created
-      if (!newUser?.id) { setErr(newUser?.message || newUser?.error || 'User creation failed'); setSaving(false); return }
-      const userId = newUser.id
-      // Step 2: Set role + primary location on users table
-      await adminFetch('update', 'users', userId, { role: d.role || 'marketing_executive', state_id: d.state_id || null, district_id: d.district_id || null, block_id: d.block_id || null })
-      // Step 3: Upload photo if provided
-      let photoUrl = null
+        state_id: d.state_id || null, district_id: d.district_id || null, block_id: d.block_id || null,
+      }
+      // Step 1: create the auth user + profile, or update the profile
+      let userId = d.id
+      if (isEdit) {
+        await adminFetch('update_user', null, userId, core)
+      } else {
+        const created = await adminFetch('create_user', null, null, { ...core, email: d.email, password: d.password })
+        userId = created?.user?.id
+        if (!userId) { setErr('User creation failed'); setSaving(false); return }
+      }
+      // Step 2: upload photo if a new one was picked
+      let photoUrl = d.photo_url || null
       if (d.photoBase64 && d.photoFileName) {
         const upRes = await adminFetch('upload_photo', null, null, { filename: `${userId}_${d.photoFileName}`, contentType: d.photoContentType || 'image/jpeg', base64data: d.photoBase64 })
-        photoUrl = upRes?.url || null
+        photoUrl = upRes?.url || photoUrl
       }
-      // Step 4: Store extended profile in sales_targets (incentive_slab JSONB)
+      // Step 3: extended profile lives in sales_targets (incentive_slab JSONB)
       const profile = {
         address: d.address || null, aadhaar_no: d.aadhaar_no || null, pan_no: d.pan_no || null,
         emergency1: { name: d.emg1_name || '', relationship: d.emg1_rel || '' },
@@ -559,14 +596,43 @@ export default function App() {
         panchayat_id: d.panchayat_id || null, village_id: d.village_id || null,
         employee_id: d.employee_id || null, joining_date: d.joining_date || null, photo_url: photoUrl,
       }
-      await adminFetch('insert', 'sales_targets', null, { user_id: userId, period_month: 0, period_year: 0, target_amount: 0, achieved_amount: 0, status: 'executive_profile', notes: `Profile: ${d.first_name} ${d.last_name || ''}`, incentive_slab: profile })
-      // Step 5: Insert into marketing_executives for working location
-      if (d.state_id || d.district_id || d.block_id) {
-        await adminFetch('insert', 'marketing_executives', null, { user_id: userId, state_id: d.state_id || null, district_id: d.district_id || null, block_id: d.block_id || null, employee_id: d.employee_id || null, joining_date: d.joining_date || null, target_amount: 0, is_active: true })
-      }
+      const profileRow = { user_id: userId, period_month: 0, period_year: 0, target_amount: 0, achieved_amount: 0, status: 'executive_profile', notes: `Profile: ${core.first_name} ${core.last_name}`.trim(), incentive_slab: profile }
+      const [existingProfile] = isEdit ? await adminFetch('select', 'sales_targets', null, { qs: `select=id&user_id=eq.${userId}&status=eq.executive_profile&limit=1` }) : []
+      if (existingProfile) await adminFetch('update', 'sales_targets', existingProfile.id, profileRow)
+      else await adminFetch('insert', 'sales_targets', null, profileRow)
+      // Step 4: working location in marketing_executives
+      const exec = { user_id: userId, state_id: core.state_id, district_id: core.district_id, block_id: core.block_id, employee_id: d.employee_id || null, joining_date: d.joining_date || null }
+      const [existingExec] = isEdit ? await adminFetch('select', 'marketing_executives', null, { qs: `select=id&user_id=eq.${userId}&limit=1` }) : []
+      if (existingExec) await adminFetch('update', 'marketing_executives', existingExec.id, exec)
+      else if (core.state_id || core.district_id || core.block_id) await adminFetch('insert', 'marketing_executives', null, { ...exec, target_amount: 0, is_active: true })
+      if (userId === user?.id) setUser(u => ({ ...u, ...core }))
       await loadAll(); closeModal()
     } catch (e) { setErr(e.message) }
     setSaving(false)
+  }
+  const setUserActive = async (u, active) => {
+    try { await adminFetch('update_user', null, u.id, { is_active: active }); await loadAll() } catch (e) { alert(e.message) }
+  }
+  const resetUserPassword = async (u, password) => {
+    setSaving(true)
+    try { await adminFetch('reset_password', null, u.id, { password }); closeModal(); showToast(`Password reset ho gaya: ${u.email}`) } catch (e) { setErr(e.message) }
+    setSaving(false)
+  }
+  const changeOwnPassword = async (current, next) => {
+    setSaving(true)
+    try {
+      // Re-check the current password before changing it
+      const { error: authErr } = await supabase.auth.signInWithPassword({ email: user.email, password: current })
+      if (authErr) { setErr('Current password galat hai'); setSaving(false); return }
+      const { error } = await supabase.auth.updateUser({ password: next })
+      if (error) throw error
+      closeModal(); showToast('Password change ho gaya')
+    } catch (e) { setErr(e.message) }
+    setSaving(false)
+  }
+  const openEditUser = async (u) => {
+    const rows = await adminFetch('select', 'sales_targets', null, { qs: `select=incentive_slab&user_id=eq.${u.id}&status=eq.executive_profile&limit=1` }).catch(() => [])
+    openModal('executive', { ...u, _profile: rows?.[0]?.incentive_slab || {} })
   }
   const deletePortalUser = async (id) => {
     try { await adminFetch('delete_user', null, id); await loadAll() } catch (e) { alert(e.message) }
@@ -613,7 +679,7 @@ export default function App() {
   // ─── AUTH SCREEN ─────────────────────────────────────────
   if (loading) return <div className="min-h-screen flex items-center justify-center"><div className="text-green-600 text-xl">Loading...</div></div>
 
-  if (!user) return (
+  if (!user || recovery) return (
     <div className="min-h-screen bg-gradient-to-br from-green-50 to-emerald-100 flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-8">
         <div className="text-center mb-6">
@@ -622,10 +688,15 @@ export default function App() {
           </div>
           <span className="inline-block mt-1 text-xs bg-green-100 text-green-700 px-3 py-0.5 rounded-full font-medium">Distribution Management System</span>
         </div>
-        <h2 className="text-lg font-semibold text-center mb-5 text-gray-700">Sign In</h2>
+        <h2 className="text-lg font-semibold text-center mb-5 text-gray-700">{recovery ? 'Set New Password' : authMode === 'forgot' ? 'Forgot Password' : 'Sign In'}</h2>
         {err && <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-600 rounded-lg text-sm">{err}</div>}
-        <AuthLogin onLogin={login} loading={saving} />
-        <p className="text-center text-xs text-gray-400 mt-4">Admin aur sabhi users ek hi login use karte hain. Naya account admin banata hai.</p>
+        {notice && !recovery && <div className="mb-4 p-3 bg-green-50 border border-green-200 text-green-700 rounded-lg text-sm">{notice}</div>}
+        {recovery
+          ? <AuthNewPassword onSave={setNewPassword} loading={saving} />
+          : authMode === 'forgot'
+            ? <AuthForgot onSend={sendResetLink} loading={saving} onBack={() => { setAuthMode('login'); setErr('') }} />
+            : <AuthLogin onLogin={login} loading={saving} onForgot={() => { setAuthMode('forgot'); setErr(''); setNotice('') }} />}
+        {!recovery && <p className="text-center text-xs text-gray-400 mt-4">Admin aur sabhi users ek hi login use karte hain. Naya account admin banata hai.</p>}
       </div>
     </div>
   )
@@ -658,6 +729,7 @@ export default function App() {
         </nav>
         <div className={`p-3 border-t border-gray-700 ${!sidebarOpen && 'flex justify-center'}`}>
           {sidebarOpen && <div className="mb-2"><p className="text-sm font-medium text-white truncate">{user.first_name} {user.last_name || ''}</p><p className="text-xs text-gray-400">{ROLE_LABEL[user.role] || user.role}</p></div>}
+          <button onClick={() => openModal('changePassword')} title="Change Password" className="block text-xs text-gray-400 hover:text-white mb-1.5">{sidebarOpen ? '🔑 Change Password' : '🔑'}</button>
           <button onClick={logout} className="text-xs text-red-400 hover:text-red-300">{sidebarOpen ? '🚪 Logout' : '🚪'}</button>
         </div>
       </aside>
@@ -681,6 +753,7 @@ export default function App() {
             )}
           </div>
         </header>
+        {toast && <div className="fixed top-4 right-4 z-[70] bg-green-600 text-white text-sm px-4 py-2.5 rounded-lg shadow-lg">✓ {toast}</div>}
         <main className="flex-1 overflow-y-auto p-5">
           {tab === 'dashboard' && <RenderDashboard orders={orders} customers={customers} invoices={invoices} inventory={inventory} lowStock={lowStock} />}
           {tab === 'products' && <RenderProducts products={products} categories={categories} inventory={inventory} openModal={openModal} askDel={askDel} delProduct={delProduct} />}
@@ -690,7 +763,7 @@ export default function App() {
           {tab === 'payments' && <RenderPayments payments={payments} openModal={openModal} askDel={askDel} delPayment={delPayment} />}
           {tab === 'inventory' && <RenderInventory inventory={inventory} invTab={invTab} setInvTab={setInvTab} openModal={openModal} />}
           {tab === 'reports' && <RenderReports orders={orders} payments={payments} period={reportPeriod} setPeriod={setReportPeriod} />}
-          {tab === 'executives' && <RenderExecutives portalUsers={portalUsers} user={user} states={states} districts={districts} blocks={blocks} panchayats={panchayats} villages={villages} openModal={openModal} askDel={askDel} deletePortalUser={deletePortalUser} />}
+          {tab === 'executives' && <RenderExecutives portalUsers={portalUsers} user={user} states={states} districts={districts} blocks={blocks} panchayats={panchayats} villages={villages} openModal={openModal} askDel={askDel} deletePortalUser={deletePortalUser} openEditUser={openEditUser} setUserActive={setUserActive} />}
           {tab === 'locations' && <RenderLocations states={states} districts={districts} blocks={blocks} panchayats={panchayats} villages={villages} openModal={openModal} askDel={askDel} delLocation={delLocation} />}
         </main>
       </div>
@@ -709,7 +782,9 @@ export default function App() {
                 {modal.type === 'invoice' && (modal.data?.id ? 'Edit Invoice' : 'Create Invoice')}
                 {modal.type === 'invoiceDetail' && `Invoice: ${modal.data?.invoice_number}`}
                 {modal.type === 'payment' && 'Record Payment'}
-                {modal.type === 'executive' && 'Create Portal User'}
+                {modal.type === 'executive' && (modal.data?.id ? 'Edit User' : 'Create Portal User')}
+                {modal.type === 'changePassword' && 'Change Password'}
+                {modal.type === 'resetPassword' && 'Reset User Password'}
                 {modal.type === 'location' && `Add ${modal.data?.label || 'Location'}`}
                 {modal.type === 'stockAdjust' && `Adjust Stock: ${modal.data?.products?.name}`}
               </h3>
@@ -725,7 +800,9 @@ export default function App() {
               {modal.type === 'invoice' && <InvoiceForm data={modal.data} orders={orders} customers={customers} states={states} districts={districts} blocks={blocks} onSave={saveInvoice} onCancel={closeModal} saving={saving} />}
               {modal.type === 'invoiceDetail' && <InvoiceDetail invoice={modal.data} user={user} onPrint={() => { printInvoice(modal.data.id) }} />}
               {modal.type === 'payment' && <PaymentForm invoices={invoices} customers={customers} onSave={savePayment} onCancel={closeModal} saving={saving} />}
-              {modal.type === 'executive' && <UserCreateForm states={states} districts={districts} blocks={blocks} panchayats={panchayats} villages={villages} onSave={saveAdminUser} onCancel={closeModal} saving={saving} />}
+              {modal.type === 'executive' && <UserCreateForm data={modal.data} currentUser={user} states={states} districts={districts} blocks={blocks} panchayats={panchayats} villages={villages} onSave={saveAdminUser} onCancel={closeModal} saving={saving} />}
+              {modal.type === 'changePassword' && <ChangePasswordForm onSave={changeOwnPassword} onCancel={closeModal} saving={saving} />}
+              {modal.type === 'resetPassword' && <ResetPasswordForm target={modal.data} onSave={resetUserPassword} onCancel={closeModal} saving={saving} />}
               {modal.type === 'location' && <LocationForm locType={modal.data?.locType} fields={modal.data?.fields} initial={modal.data?.initial} onSave={saveLocation} onCancel={closeModal} saving={saving} />}
               {modal.type === 'stockAdjust' && <StockAdjustForm item={modal.data} onSave={adjustInventory} onCancel={closeModal} />}
             </div>
@@ -1207,12 +1284,17 @@ function UserProfileModal({ u, panchayats, villages, onClose }) {
   )
 }
 
-function RenderExecutives({ portalUsers, user, states, districts, blocks, panchayats, villages, openModal, askDel, deletePortalUser }) {
+function RenderExecutives({ portalUsers, user, states, districts, blocks, panchayats, villages, openModal, askDel, deletePortalUser, openEditUser, setUserActive }) {
   const [roleFilter, setRoleFilter] = useState('all')
   const [viewUser, setViewUser] = useState(null)
-  const roles = ['all', 'state_admin', 'district_admin', 'block_admin', 'marketing_executive', 'accountant', 'retailer']
-  const filtered = roleFilter === 'all' ? portalUsers : portalUsers.filter(u => u.role === roleFilter)
+  const [q, setQ] = useState('')
+  const roles = ['all', 'super_admin', 'state_admin', 'district_admin', 'block_admin', 'marketing_executive', 'accountant', 'retailer']
+  const filtered = portalUsers
+    .filter(u => roleFilter === 'all' || u.role === roleFilter)
+    .filter(u => !q || `${u.first_name} ${u.last_name || ''} ${u.email} ${u.phone || ''}`.toLowerCase().includes(q.toLowerCase()))
   const isAdmin = user?.role === 'super_admin' || user?.role === 'state_admin'
+  // super admin manages everyone; state admin only non-admin users
+  const canManage = u => isAdmin && (user.role === 'super_admin' || !['super_admin', 'state_admin'].includes(u.role))
   return (
     <div className="space-y-4">
       {viewUser && <UserProfileModal u={viewUser} panchayats={panchayats} villages={villages} onClose={() => setViewUser(null)} />}
@@ -1220,10 +1302,11 @@ function RenderExecutives({ portalUsers, user, states, districts, blocks, pancha
         <div className="flex flex-wrap gap-1.5">
           {roles.map(r => (
             <button key={r} onClick={() => setRoleFilter(r)} className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${roleFilter === r ? 'bg-green-600 text-white border-green-600' : 'hover:bg-gray-50 text-gray-600'}`}>
-              {r === 'all' ? `All (${portalUsers.length})` : ROLE_LABEL[r] || r}
+              {r === 'all' ? `All (${portalUsers.length})` : `${ROLE_LABEL[r] || r} (${portalUsers.filter(u => u.role === r).length})`}
             </button>
           ))}
         </div>
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search name / email / phone..." className="border rounded-lg px-3 py-1.5 text-sm w-60 focus:outline-none focus:ring-2 focus:ring-green-500" />
         {isAdmin && <button onClick={() => openModal('executive')} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 font-medium">+ Create User</button>}
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -1237,7 +1320,7 @@ function RenderExecutives({ portalUsers, user, states, districts, blocks, pancha
                     <span className="text-green-700 font-bold text-lg">{(u.first_name?.[0] || u.email?.[0] || '?').toUpperCase()}</span>
                   </div>
                   <div>
-                    <p className="font-semibold text-gray-800">{u.first_name} {u.last_name || ''}</p>
+                    <p className="font-semibold text-gray-800">{u.first_name} {u.last_name || ''}{u.id === user?.id && <span className="ml-1 text-xs text-gray-400">(you)</span>}</p>
                     <p className="text-xs text-gray-500">{u.email}</p>
                   </div>
                 </div>
@@ -1249,8 +1332,15 @@ function RenderExecutives({ portalUsers, user, states, districts, blocks, pancha
               )}
               <div className="flex items-center justify-between pt-2 border-t mt-2" onClick={e => e.stopPropagation()}>
                 <span className={`text-xs px-2 py-0.5 rounded-full ${u.is_active !== false ? 'bg-green-50 text-green-600' : 'bg-red-50 text-red-500'}`}>{u.is_active !== false ? 'Active' : 'Inactive'}</span>
-                {isAdmin && u.id !== user?.id && (
-                  <button onClick={() => askDel(`Delete user "${u.first_name} ${u.last_name || ''}"?`, () => deletePortalUser(u.id))} className="text-xs text-red-400 hover:text-red-600 px-2 py-0.5 rounded hover:bg-red-50">Delete</button>
+                {canManage(u) && (
+                  <div className="flex flex-wrap gap-1 justify-end">
+                    <button onClick={() => openEditUser(u)} className="text-xs text-amber-600 px-2 py-0.5 rounded hover:bg-amber-50">Edit</button>
+                    {u.id !== user?.id && <>
+                      <button onClick={() => openModal('resetPassword', u)} className="text-xs text-blue-600 px-2 py-0.5 rounded hover:bg-blue-50">Reset Pwd</button>
+                      <button onClick={() => setUserActive(u, u.is_active === false)} className="text-xs text-gray-600 px-2 py-0.5 rounded hover:bg-gray-100">{u.is_active === false ? 'Activate' : 'Deactivate'}</button>
+                      <button onClick={() => askDel(`Delete user "${u.first_name} ${u.last_name || ''}"? Ye permanent hai.`, () => deletePortalUser(u.id))} className="text-xs text-red-500 px-2 py-0.5 rounded hover:bg-red-50">Delete</button>
+                    </>}
+                  </div>
                 )}
               </div>
             </div>
@@ -1401,15 +1491,86 @@ function RenderLocations({ states, districts, blocks, panchayats, villages, open
 }
 
 // ─── AUTH FORMS ───────────────────────────────────────────────
-function AuthLogin({ onLogin, loading }) {
+function AuthLogin({ onLogin, loading, onForgot }) {
   const [f, setF] = useState({ email: '', password: '' })
   return (
     <div className="space-y-4">
       <FRow label="Email" required><input className={inp} type="email" value={f.email} onChange={e => setF({ ...f, email: e.target.value })} placeholder="you@soil.com" /></FRow>
       <FRow label="Password" required><input className={inp} type="password" value={f.password} onChange={e => setF({ ...f, password: e.target.value })} onKeyDown={e => e.key === 'Enter' && onLogin(f.email, f.password)} placeholder="••••••••" /></FRow>
+      <div className="text-right -mt-2"><button type="button" onClick={onForgot} className="text-xs text-green-700 hover:underline">Forgot password?</button></div>
       <button onClick={() => onLogin(f.email, f.password)} disabled={loading} className="w-full py-2.5 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 disabled:opacity-60">
         {loading ? 'Signing in...' : 'Sign In'}
       </button>
+    </div>
+  )
+}
+function AuthForgot({ onSend, loading, onBack }) {
+  const [email, setEmail] = useState('')
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-gray-500">Apna registered email daalein. Password reset link email par aayega.</p>
+      <FRow label="Email" required><input className={inp} type="email" value={email} onChange={e => setEmail(e.target.value)} onKeyDown={e => e.key === 'Enter' && onSend(email)} placeholder="you@soil.com" /></FRow>
+      <button onClick={() => onSend(email)} disabled={loading} className="w-full py-2.5 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 disabled:opacity-60">
+        {loading ? 'Sending...' : 'Send Reset Link'}
+      </button>
+      <div className="text-center"><button type="button" onClick={onBack} className="text-xs text-gray-500 hover:underline">← Back to Sign In</button></div>
+    </div>
+  )
+}
+function AuthNewPassword({ onSave, loading }) {
+  const [f, setF] = useState({ password: '', confirm: '' })
+  return (
+    <div className="space-y-4">
+      <FRow label="New Password" required><input className={inp} type="password" value={f.password} onChange={e => setF({ ...f, password: e.target.value })} placeholder="Min 6 characters" /></FRow>
+      <FRow label="Confirm Password" required><input className={inp} type="password" value={f.confirm} onChange={e => setF({ ...f, confirm: e.target.value })} onKeyDown={e => e.key === 'Enter' && onSave(f.password, f.confirm)} /></FRow>
+      <button onClick={() => onSave(f.password, f.confirm)} disabled={loading} className="w-full py-2.5 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 disabled:opacity-60">
+        {loading ? 'Saving...' : 'Set Password'}
+      </button>
+    </div>
+  )
+}
+function ChangePasswordForm({ onSave, onCancel, saving }) {
+  const [f, setF] = useState({ current: '', password: '', confirm: '' })
+  const [localErr, setLocalErr] = useState('')
+  const submit = () => {
+    if (!f.current) return setLocalErr('Current password daalein')
+    if (f.password.length < 6) return setLocalErr('New password kam se kam 6 characters ka ho')
+    if (f.password !== f.confirm) return setLocalErr('Dono new password match nahi kar rahe')
+    if (f.password === f.current) return setLocalErr('New password purane se alag hona chahiye')
+    setLocalErr(''); onSave(f.current, f.password)
+  }
+  return (
+    <div className="space-y-4">
+      {localErr && <div className="p-3 bg-red-50 border border-red-200 text-red-600 rounded-lg text-sm">{localErr}</div>}
+      <FRow label="Current Password" required><input className={inp} type="password" value={f.current} onChange={e => setF({ ...f, current: e.target.value })} /></FRow>
+      <FRow label="New Password" required><input className={inp} type="password" value={f.password} onChange={e => setF({ ...f, password: e.target.value })} placeholder="Min 6 characters" /></FRow>
+      <FRow label="Confirm New Password" required><input className={inp} type="password" value={f.confirm} onChange={e => setF({ ...f, confirm: e.target.value })} onKeyDown={e => e.key === 'Enter' && submit()} /></FRow>
+      <div className="flex justify-end gap-3 pt-2">
+        <button onClick={onCancel} className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50">Cancel</button>
+        <button onClick={submit} disabled={saving} className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-60">{saving ? 'Saving...' : 'Change Password'}</button>
+      </div>
+    </div>
+  )
+}
+function ResetPasswordForm({ target, onSave, onCancel, saving }) {
+  const [password, setPassword] = useState('')
+  const [localErr, setLocalErr] = useState('')
+  const generate = () => setPassword('Soil@' + Math.random().toString(36).slice(2, 8) + Math.floor(Math.random() * 90 + 10))
+  const submit = () => password.length < 6 ? setLocalErr('Password kam se kam 6 characters ka ho') : (setLocalErr(''), onSave(target, password))
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-gray-600"><span className="font-semibold">{target.first_name} {target.last_name || ''}</span> ({target.email}) ka naya password set karein. Ye password user ko khud batayein.</p>
+      {localErr && <div className="p-3 bg-red-50 border border-red-200 text-red-600 rounded-lg text-sm">{localErr}</div>}
+      <FRow label="New Password" required>
+        <div className="flex gap-2">
+          <input className={inp} type="text" value={password} onChange={e => setPassword(e.target.value)} placeholder="Min 6 characters" />
+          <button type="button" onClick={generate} className="px-3 py-2 border rounded-lg text-xs whitespace-nowrap hover:bg-gray-50">Generate</button>
+        </div>
+      </FRow>
+      <div className="flex justify-end gap-3 pt-2">
+        <button onClick={onCancel} className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50">Cancel</button>
+        <button onClick={submit} disabled={saving} className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-60">{saving ? 'Saving...' : 'Reset Password'}</button>
+      </div>
     </div>
   )
 }
@@ -1888,15 +2049,31 @@ function SectionHead({ title, color = 'green' }) {
   return <div className={`text-xs font-bold uppercase tracking-widest px-3 py-1.5 rounded-lg border ${cls[color] || cls.green}`}>{title}</div>
 }
 
-function UserCreateForm({ states, districts, blocks, panchayats, villages, onSave, onCancel, saving }) {
-  const [f, setF] = useState({ first_name: '', last_name: '', email: '', phone: '', password: '', role: 'marketing_executive', employee_id: '', joining_date: new Date().toISOString().slice(0,10), address: '', aadhaar_no: '', pan_no: '', emg1_name: '', emg1_rel: '', emg2_name: '', emg2_rel: '', state_id: '', district_id: '', block_id: '', panchayat_id: '', village_id: '', photoBase64: null, photoFileName: null, photoContentType: null })
+function UserCreateForm({ data, currentUser, states, districts, blocks, panchayats, villages, onSave, onCancel, saving }) {
+  const isEdit = !!data?.id
+  const pr = data?._profile || {}
+  const [f, setF] = useState({
+    id: data?.id, first_name: data?.first_name || '', last_name: data?.last_name || '', email: data?.email || '', phone: data?.phone || '', password: '',
+    role: data?.role || 'marketing_executive', employee_id: pr.employee_id || '', joining_date: pr.joining_date || (isEdit ? '' : new Date().toISOString().slice(0,10)),
+    address: pr.address || '', aadhaar_no: pr.aadhaar_no || '', pan_no: pr.pan_no || '',
+    emg1_name: pr.emergency1?.name || '', emg1_rel: pr.emergency1?.relationship || '', emg2_name: pr.emergency2?.name || '', emg2_rel: pr.emergency2?.relationship || '',
+    state_id: data?.state_id || '', district_id: data?.district_id || '', block_id: data?.block_id || '', panchayat_id: pr.panchayat_id || '', village_id: pr.village_id || '',
+    photo_url: pr.photo_url || null, photoBase64: null, photoFileName: null, photoContentType: null,
+  })
   const set = (k, v) => setF(p => ({ ...p, [k]: v }))
+  const isSelf = isEdit && data.id === currentUser?.id
+  const roleOptions = [
+    ...(currentUser?.role === 'super_admin' ? [['super_admin','Super Admin'], ['state_admin','State Admin']] : []),
+    ['district_admin','District Admin'], ['block_admin','Block Admin'], ['marketing_executive','Marketing Executive'], ['accountant','Accountant'], ['retailer','Retailer'],
+  ]
+  // keep the current role visible even if this admin could not assign it
+  if (!roleOptions.some(([k]) => k === f.role)) roleOptions.unshift([f.role, ROLE_LABEL[f.role] || f.role])
   const needs = ROLE_NEEDS_LOC[f.role] || []
   const filtDist = districts.filter(d => !f.state_id || d.state_id === f.state_id)
   const filtBlocks = blocks.filter(b => !f.district_id || b.district_id === f.district_id)
   const filtPanch = panchayats.filter(p => !f.block_id || p.block_id === f.block_id)
   const filtVil = villages.filter(v => !f.panchayat_id || v.gram_panchayat_id === f.panchayat_id)
-  const [photoPreview, setPhotoPreview] = useState(null)
+  const [photoPreview, setPhotoPreview] = useState(pr.photo_url || null)
   const handlePhoto = e => {
     const file = e.target.files[0]; if (!file) return
     const reader = new FileReader()
@@ -1916,11 +2093,11 @@ function UserCreateForm({ states, districts, blocks, panchayats, villages, onSav
       <div className="grid grid-cols-2 gap-4">
         <FRow label="First Name" required><input className={inp} value={f.first_name} onChange={e => set('first_name', e.target.value)} /></FRow>
         <FRow label="Last Name"><input className={inp} value={f.last_name} onChange={e => set('last_name', e.target.value)} /></FRow>
-        <FRow label="Email" required><input className={inp} type="email" value={f.email} onChange={e => set('email', e.target.value)} /></FRow>
+        <FRow label="Email" required><input className={`${inp} disabled:bg-gray-100 disabled:text-gray-500`} type="email" value={f.email} disabled={isEdit} onChange={e => set('email', e.target.value)} /></FRow>
         <FRow label="Phone"><input className={inp} type="tel" value={f.phone} onChange={e => set('phone', e.target.value)} /></FRow>
-        <FRow label="Password" required><input className={inp} type="password" placeholder="Temporary password" value={f.password} onChange={e => set('password', e.target.value)} /></FRow>
-        <FRow label="Role" required><select className={sel} value={f.role} onChange={e => setF(p => ({ ...p, role: e.target.value, state_id: '', district_id: '', block_id: '', panchayat_id: '', village_id: '' }))}>
-          {[['state_admin','State Admin'],['district_admin','District Admin'],['block_admin','Block Admin'],['marketing_executive','Marketing Executive'],['accountant','Accountant'],['retailer','Retailer']].map(([k,v]) => <option key={k} value={k}>{v}</option>)}
+        {!isEdit && <FRow label="Password" required><input className={inp} type="password" placeholder="Temporary password (min 6)" value={f.password} onChange={e => set('password', e.target.value)} /></FRow>}
+        <FRow label="Role" required><select className={`${sel} disabled:bg-gray-100`} value={f.role} disabled={isSelf} onChange={e => set('role', e.target.value)}>
+          {roleOptions.map(([k,v]) => <option key={k} value={k}>{v}</option>)}
         </select></FRow>
         <FRow label="Employee ID"><input className={inp} value={f.employee_id} onChange={e => set('employee_id', e.target.value)} /></FRow>
         <FRow label="Joining Date"><input className={inp} type="date" value={f.joining_date} onChange={e => set('joining_date', e.target.value)} /></FRow>
@@ -1980,7 +2157,7 @@ function UserCreateForm({ states, districts, blocks, panchayats, villages, onSav
 
       <div className="flex justify-end gap-3 pt-2 border-t sticky bottom-0 bg-white pb-1">
         <button onClick={onCancel} className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50">Cancel</button>
-        <button onClick={() => onSave(f)} disabled={saving} className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-60">{saving ? 'Creating...' : 'Create User'}</button>
+        <button onClick={() => onSave(f)} disabled={saving} className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-60">{saving ? 'Saving...' : isEdit ? 'Save Changes' : 'Create User'}</button>
       </div>
     </div>
   )

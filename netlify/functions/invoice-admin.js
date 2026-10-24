@@ -48,17 +48,33 @@ exports.handler = async (event) => {
   const { action, table, id, data } = body
   const writes = ['insert', 'update', 'delete', 'delete_where']
   if (table && !TABLES.includes(table)) return reply(400, { error: `Unknown table: ${table}` })
+  // Portal users are only changed through the user actions below
+  if (writes.includes(action) && table === 'users') return reply(403, { error: 'Use the user management actions' })
   if (writes.includes(action) && ADMIN_WRITE_TABLES.includes(table) && !isAdmin) return reply(403, { error: 'Only admins can change this data' })
-  if (['create_user', 'delete_user', 'upload_photo'].includes(action) && !isAdmin) return reply(403, { error: 'Only admins can manage users' })
-  if (caller.role === 'state_admin' && action === 'create_user' && ['super_admin', 'state_admin'].includes(data?.role)) {
-    return reply(403, { error: 'State admin cannot create admin users' })
+  const USER_ACTIONS = ['create_user', 'update_user', 'reset_password', 'delete_user', 'upload_photo']
+  if (USER_ACTIONS.includes(action) && !isAdmin) return reply(403, { error: 'Only admins can manage users' })
+  // A state admin may only manage non-admin users
+  if (caller.role === 'state_admin' && ['create_user', 'update_user'].includes(action) && ADMIN_ROLES.includes(data?.role)) {
+    return reply(403, { error: 'State admin cannot create or promote admin users' })
   }
   const enc = v => encodeURIComponent(v ?? '')
+  const loadTarget = async (userId) => {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${enc(userId)}&select=id,role`, { headers: sbHeaders })
+    return (await r.json())?.[0]
+  }
+  if (['update_user', 'reset_password', 'delete_user'].includes(action)) {
+    const target = await loadTarget(id)
+    if (!target) return reply(404, { error: 'User not found' })
+    if (caller.role === 'state_admin' && ADMIN_ROLES.includes(target.role)) return reply(403, { error: 'State admin cannot manage admin users' })
+    if (id === caller.id && action !== 'reset_password' && (action === 'delete_user' || data?.is_active === false || (data?.role && data.role !== caller.role))) {
+      return reply(400, { error: 'You cannot delete, deactivate or change the role of your own account' })
+    }
+  }
 
   try {
     let res, json
     if (action === 'create_user') {
-      const { email, password, first_name, last_name, phone, role } = data || {}
+      const { email, password, first_name, last_name, phone, role, state_id, district_id, block_id } = data || {}
       if (!email || !password || !first_name) return reply(400, { error: 'Name, email and password are required' })
       if (password.length < 6) return reply(400, { error: 'Password must be at least 6 characters' })
 
@@ -86,6 +102,9 @@ exports.handler = async (event) => {
         last_name: last_name || null,
         phone: phone || null,
         role: role || 'marketing_executive',
+        state_id: state_id || null,
+        district_id: district_id || null,
+        block_id: block_id || null,
         is_active: true,
         is_verified: true,
       }
@@ -101,8 +120,25 @@ exports.handler = async (event) => {
         return reply(profileRes.status, { error: profileJson.message || 'User profile creation failed' })
       }
       json = { user: Array.isArray(profileJson) ? profileJson[0] : profileJson }
+    } else if (action === 'update_user') {
+      const allowed = ['first_name', 'last_name', 'phone', 'role', 'state_id', 'district_id', 'block_id', 'is_active']
+      const patch = Object.fromEntries(Object.entries(data || {})
+        .filter(([k]) => allowed.includes(k))
+        .map(([k, v]) => [k, k.endsWith('_id') && !v ? null : v]))
+      if ('first_name' in patch && !String(patch.first_name || '').trim()) return reply(400, { error: 'First name is required' })
+      res = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${enc(id)}`, { method: 'PATCH', headers: sbHeaders, body: JSON.stringify(patch) })
+      const text = await res.text()
+      json = text ? JSON.parse(text) : {}
+      if (!res.ok) return reply(res.status, { error: json.message || 'User update failed' })
+      json = { user: Array.isArray(json) ? json[0] : json }
+    } else if (action === 'reset_password') {
+      const password = data?.password || ''
+      if (password.length < 6) return reply(400, { error: 'Password must be at least 6 characters' })
+      res = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${enc(id)}`, { method: 'PUT', headers: sbHeaders, body: JSON.stringify({ password }) })
+      json = await res.json()
+      if (!res.ok) return reply(res.status, { error: json.msg || json.message || 'Password reset failed' })
+      json = { success: true }
     } else if (action === 'delete_user') {
-      if (id === caller.id) return reply(400, { error: 'You cannot delete your own account' })
       // Deleting the auth user cascades to public.users and its profile rows
       res = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${enc(id)}`, { method: 'DELETE', headers: sbHeaders })
       json = res.ok ? { success: true } : await res.json()
