@@ -120,6 +120,18 @@ exports.handler = async (event) => {
         return reply(profileRes.status, { error: profileJson.message || 'User profile creation failed' })
       }
       json = { user: Array.isArray(profileJson) ? profileJson[0] : profileJson }
+    } else if (action === 'save_order') {
+      // Order + items saved in one DB transaction; stock is adjusted by triggers
+      const { order, items } = data || {}
+      res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/save_order`, {
+        method: 'POST',
+        headers: sbHeaders,
+        body: JSON.stringify({ p_id: id || null, p_order: { ...order, ...(id ? {} : { created_by: caller.id }) }, p_items: items || [] }),
+      })
+      const text = await res.text()
+      json = text ? JSON.parse(text) : null
+      if (!res.ok) return reply(400, { error: String(json?.message || 'Order save failed').replace(/^STOCK_SHORT: /, '') })
+      json = { id: json }
     } else if (action === 'update_user') {
       const allowed = ['first_name', 'last_name', 'phone', 'role', 'state_id', 'district_id', 'block_id', 'is_active']
       const patch = Object.fromEntries(Object.entries(data || {})

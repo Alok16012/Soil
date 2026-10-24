@@ -403,12 +403,17 @@ export default function App() {
     return { subtotal: sub, tax_amount: tax, total_amount: sub + tax }
   }
   const saveOrder = async (d) => {
+    const items = d.items || []
+    if (items.some(i => !(Number(i.qty ?? i.quantity) > 0))) { setErr('Har product ki quantity 0 se zyada honi chahiye'); return }
+    setErr('')
     setSaving(true)
     try {
-      const items = d.items || []
-      const sub = items.reduce((s, i) => s + (i.qty || i.quantity || 0) * (i.rate || i.unit_rate || 0), 0)
-      const tax = items.reduce((s, i) => s + (i.qty || i.quantity || 0) * (i.rate || i.unit_rate || 0) * (i.gst_rate || i.tax_rate || 0) / 100, 0)
-      const orderPayload = {
+      const qty = i => Number(i.qty ?? i.quantity ?? 0)
+      const rate = i => Number(i.rate ?? i.unit_rate ?? 0)
+      const gst = i => Number(i.gst_rate ?? i.tax_rate ?? 0)
+      const sub = items.reduce((s, i) => s + qty(i) * rate(i), 0)
+      const tax = items.reduce((s, i) => s + qty(i) * rate(i) * gst(i) / 100, 0)
+      const order = {
         customer_id: d.customer_id,
         order_status: d.order_status || d.status || 'pending',
         order_date: d.order_date || new Date().toISOString().slice(0, 10),
@@ -416,29 +421,12 @@ export default function App() {
         notes: d.notes || null,
         ...(d.id ? {} : { order_number: `ORD-${Date.now()}` }),
       }
-      let orderId = d.id
-      if (d.id) {
-        await apiFetch(`orders/${d.id}`, { method: 'PUT', body: JSON.stringify(orderPayload) })
-        // Remove old items then re-insert
-        await adminFetch('delete_where', 'order_items', null, null, 'order_id', d.id)
-      } else {
-        const created = await apiFetch('orders', { method: 'POST', body: JSON.stringify(orderPayload) })
-        if (created?.error) { setErr(created.error); setSaving(false); return }
-        orderId = created.id
-      }
-      // Insert order items
-      if (items.length > 0 && orderId) {
-        const itemRows = items.map(i => ({
-          order_id: orderId,
-          product_id: i.product_id,
-          quantity: i.qty || i.quantity || 1,
-          unit_rate: i.rate || i.unit_rate || 0,
-          tax_rate: i.gst_rate || i.tax_rate || 0,
-          tax_amount: (i.qty || i.quantity || 0) * (i.rate || i.unit_rate || 0) * (i.gst_rate || i.tax_rate || 0) / 100,
-          total_amount: (i.qty || i.quantity || 0) * (i.rate || i.unit_rate || 0),
-        }))
-        await adminFetch('insert', 'order_items', null, itemRows)
-      }
+      const itemRows = items.map(i => ({
+        product_id: i.product_id, quantity: qty(i), unit_rate: rate(i), tax_rate: gst(i),
+        tax_amount: qty(i) * rate(i) * gst(i) / 100, total_amount: qty(i) * rate(i),
+      }))
+      // One transaction on the server: order + items + stock adjustment
+      await adminFetch('save_order', null, d.id || null, { order, items: itemRows })
       await loadAll(); setOItems([]); closeModal()
     } catch (e) { setErr(e.message) }
     setSaving(false)
@@ -861,7 +849,7 @@ export default function App() {
               {modal.type === 'product' && <ProductForm data={modal.data} categories={categories} onSave={saveProduct} onCancel={closeModal} saving={saving} />}
               {modal.type === 'category' && <CatManager cats={categories} onSave={saveCat} onDel={delCat} onClose={closeModal} />}
               {modal.type === 'customer' && <CustomerForm data={modal.data} states={states} districts={districts} blocks={blocks} onSave={saveCust} onCancel={closeModal} saving={saving} />}
-              {modal.type === 'order' && <OrderForm data={modal.data} customers={customers} products={products} items={oItems} setItems={setOItems} onSave={saveOrder} onCancel={closeModal} saving={saving} />}
+              {modal.type === 'order' && <OrderForm data={modal.data} customers={customers} products={products} inventory={inventory} items={oItems} setItems={setOItems} onSave={saveOrder} onCancel={closeModal} saving={saving} />}
               {modal.type === 'orderDetail' && <OrderDetail order={modal.data} />}
               {modal.type === 'invoice' && <InvoiceForm data={modal.data} orders={orders} customers={customers} states={states} districts={districts} blocks={blocks} onSave={saveInvoice} onCancel={closeModal} saving={saving} />}
               {modal.type === 'invoiceDetail' && <InvoiceDetail invoice={modal.data} user={user} onPrint={() => { printInvoice(modal.data.id) }} />}
@@ -1721,7 +1709,11 @@ function CustomerForm({ data, states, districts, blocks, onSave, onCancel, savin
 }
 
 // ─── ORDER FORM ───────────────────────────────────────────────
-function OrderForm({ data, customers, products, items, setItems, onSave, onCancel, saving }) {
+function OrderForm({ data, customers, products, inventory = [], items, setItems, onSave, onCancel, saving }) {
+  // Stock available to this order: current stock plus what this order already holds (when editing)
+  const [heldByOrder] = useState(() => data?.id && (data?.order_status || data?.status) !== 'cancelled'
+    ? Object.fromEntries(items.map(i => [i.product_id, Number(i.qty || 0)])) : {})
+  const stockOf = pid => Number(inventory.find(x => x.product_id === pid)?.quantity || 0) + (heldByOrder[pid] || 0)
   const [custId, setCustId] = useState(data?.customer_id || data?.customers?.id || '')
   const [status, setStatus] = useState(data?.order_status || data?.status || 'pending')
 
@@ -1760,16 +1752,20 @@ function OrderForm({ data, customers, products, items, setItems, onSave, onCance
       <FRow label="Add Product">
         <select className={sel} onChange={e => { if (e.target.value) { addItem(e.target.value); e.target.value = '' } }} defaultValue="">
           <option value="">Select product...</option>
-          {products.filter(p => p.is_active !== false).map(p => <option key={p.id} value={p.id}>{p.name} — {cur(p.price_cnf || p.mrp)}/{p.unit}</option>)}
+          {products.filter(p => p.is_active !== false).map(p => <option key={p.id} value={p.id}>{p.name} — {cur(p.price_cnf || p.mrp)}/{p.unit} (stock: {stockOf(p.id)})</option>)}
         </select>
       </FRow>
+      {status !== 'cancelled' && items.some(i => i.qty > stockOf(i.product_id)) && (
+        <p className="text-xs text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">Kuch products ka stock kam hai — pehle Inventory me stock add karein.</p>
+      )}
       {items.length > 0 && (
         <div className="border rounded-xl overflow-hidden">
-          <table className="w-full text-sm"><thead><tr className="bg-gray-50 text-xs text-gray-500"><th className="px-3 py-2 text-left">Product</th><th className="px-3 py-2">Qty</th><th className="px-3 py-2">Rate</th><th className="px-3 py-2">GST%</th><th className="px-3 py-2 text-right">Amount</th><th></th></tr></thead>
+          <table className="w-full text-sm"><thead><tr className="bg-gray-50 text-xs text-gray-500"><th className="px-3 py-2 text-left">Product</th><th className="px-3 py-2">Qty</th><th className="px-3 py-2">Stock</th><th className="px-3 py-2">Rate</th><th className="px-3 py-2">GST%</th><th className="px-3 py-2 text-right">Amount</th><th></th></tr></thead>
             <tbody>{items.map(i => (
               <tr key={i.product_id} className="border-t">
                 <td className="px-3 py-2 font-medium">{i.product_name}</td>
                 <td className="px-3 py-2"><input type="number" min="1" className="border rounded px-2 py-1 text-xs w-16" value={i.qty} onChange={e => updItem(i.product_id, 'qty', e.target.value)} /></td>
+                <td className={`px-3 py-2 text-xs text-center ${status !== 'cancelled' && i.qty > stockOf(i.product_id) ? 'text-red-600 font-semibold' : 'text-gray-500'}`}>{stockOf(i.product_id)}</td>
                 <td className="px-3 py-2"><input type="number" className="border rounded px-2 py-1 text-xs w-20" value={i.rate} onChange={e => updItem(i.product_id, 'rate', e.target.value)} /></td>
                 <td className="px-3 py-2 text-center text-gray-500">{i.gst_rate}%</td>
                 <td className="px-3 py-2 text-right font-medium">{cur(i.qty * i.rate)}</td>
