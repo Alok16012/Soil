@@ -1,27 +1,49 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react'
 import Image from 'next/image'
-import { supabase } from './lib/supabase'
+import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from './lib/supabase'
 import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 
 // ─── API CONFIG ───────────────────────────────────────────────
 let sessionExpired = false
+// Turn Postgres constraint errors into messages a user can act on
+const FK_USED_IN = { orders: 'orders', order_items: 'orders', invoices: 'invoices', invoice_items: 'invoices', payments: 'payments', customers: 'customers', users: 'users', districts: 'districts', blocks: 'blocks', gram_panchayats: 'gram panchayats', villages: 'villages' }
+const friendlyDbError = msg => {
+  const fk = String(msg).match(/violates foreign key constraint .* on table "(\w+)"/)
+  if (fk) return `Ye record ${FK_USED_IN[fk[1]] || fk[1]} me use ho raha hai, isliye delete nahi ho sakta. Pehle related ${FK_USED_IN[fk[1]] || fk[1]} delete karein.`
+  if (/duplicate key value/.test(msg)) return 'Ye entry pehle se maujood hai (duplicate).'
+  if (/null value in column "(\w+)"/.test(msg)) return `${msg.match(/null value in column "(\w+)"/)[1].replace(/_/g, ' ')} required hai.`
+  return msg
+}
+const handleUnauthorized = async () => {
+  // Session was revoked or expired on the server: drop it locally and return to login
+  sessionExpired = true
+  await supabase.auth.signOut({ scope: 'local' })
+  throw new Error('Session expire ho gaya. Dobara login karein.')
+}
+// Read-only queries skip the Netlify function; row level security limits them to active users
+const directSelect = async (table, qs, session) => {
+  if (!session) return handleUnauthorized()
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${qs}`, {
+    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
+  })
+  if (res.status === 401) return handleUnauthorized()
+  const json = await res.json()
+  if (!res.ok) throw new Error(json?.message || 'Database request failed')
+  return json
+}
 const adminFetch = async (action, table, id, data = null, field = null, value = null) => {
   const { data: { session } } = await supabase.auth.getSession()
+  if (action === 'select') return directSelect(table, data?.qs || '', session)
   const res = await fetch('/.netlify/functions/invoice-admin', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(session ? { Authorization: `Bearer ${session.access_token}` } : {}) },
     body: JSON.stringify({ action, table, id, data, field, value }),
   })
   const json = await res.json()
-  if (res.status === 401) {
-    // Session was revoked or expired on the server: drop it locally and return to login
-    sessionExpired = true
-    await supabase.auth.signOut({ scope: 'local' })
-    throw new Error('Session expire ho gaya. Dobara login karein.')
-  }
+  if (res.status === 401) return handleUnauthorized()
   if (!res.ok || (json && !Array.isArray(json) && json.error)) {
-    throw new Error(json?.error?.message || json?.error || json?.message || 'Database request failed')
+    throw new Error(friendlyDbError(json?.error?.message || json?.error || json?.message || 'Database request failed'))
   }
   return json
 }
@@ -32,7 +54,7 @@ const API_RESOURCES = {
   customers: { table: 'customers', select: '*', order: 'created_at.desc' },
   orders: { table: 'orders', select: '*,customers(name)', order: 'created_at.desc' },
   payments: { table: 'payments', select: '*,customers(name),invoices(invoice_number)', order: 'created_at.desc' },
-  inventory: { table: 'inventory', select: '*,products(name,product_code,mrp,unit)', order: 'created_at.desc' },
+  inventory: { table: 'inventory', select: '*,products(name,product_code,mrp,unit,is_active)', order: 'created_at.desc' },
   states: { table: 'states', select: '*', order: 'name.asc' },
   districts: { table: 'districts', select: '*', order: 'name.asc' },
   blocks: { table: 'blocks', select: '*', order: 'name.asc' },
@@ -44,8 +66,10 @@ const API_RESOURCES = {
 const cleanDbPayload = value => Object.fromEntries(
   Object.entries(value || {})
     .filter(([key, val]) => !['id', 'created_at', 'updated_at'].includes(key) && (val === null || typeof val !== 'object') && val !== undefined)
-    .map(([key, val]) => [key, key.endsWith('_id') && val === '' ? null : val])
+    // empty form fields become NULL (an empty string is not a valid number/uuid); NOT NULL numbers fall back to 0
+    .map(([key, val]) => [key, val === '' ? (ZERO_IF_EMPTY.includes(key) ? 0 : null) : val])
 )
+const ZERO_IF_EMPTY = ['credit_limit', 'gst_rate', 'quantity', 'reorder_level']
 
 const apiFetch = async (path, opts = {}) => {
   const [resource, id] = path.split('/')
@@ -213,7 +237,8 @@ export default function App() {
       setOrders(Array.isArray(ord) ? ord : [])
       setInvoices(Array.isArray(inv) ? inv : [])
       setPayments(Array.isArray(pay) ? pay : [])
-      setInventory(Array.isArray(invnt) ? invnt : [])
+      // archived products drop out of stock views
+      setInventory(Array.isArray(invnt) ? invnt.filter(i => i.products?.is_active !== false) : [])
       setStates(Array.isArray(st) ? st : [])
       setDistricts(Array.isArray(dist) ? dist : [])
       setBlocks(Array.isArray(bl) ? bl : [])
@@ -322,6 +347,9 @@ export default function App() {
 
   // ── PRODUCTS ──
   const saveProduct = async (d) => {
+    if (!d.name?.trim()) { setErr('Product name is required'); return }
+    if ([d.mrp, d.price_cnf, d.price_dd, d.price_btd, d.price_ksk, d.price_farmer].some(v => v !== '' && v != null && Number(v) < 0)) { setErr('Price negative nahi ho sakta'); return }
+    setErr('')
     setSaving(true)
     try {
       if (d.id) await apiFetch(`products/${d.id}`, { method: 'PUT', body: JSON.stringify(d) })
@@ -331,7 +359,12 @@ export default function App() {
     setSaving(false)
   }
   const delProduct = async (id) => {
-    try { await apiFetch(`products/${id}`, { method: 'DELETE' }); await loadAll() } catch (e) { alert(e.message) }
+    try { await apiFetch(`products/${id}`, { method: 'DELETE' }); await loadAll() } catch (e) {
+      if (!/use ho raha hai/.test(e.message)) { alert(e.message); return }
+      // Product appears in past orders: archive it so history stays intact but it leaves the catalogue
+      try { await apiFetch(`products/${id}`, { method: 'PATCH', body: JSON.stringify({ is_active: false }) }); await loadAll(); showToast('Product orders me use hua hai, isliye archive kar diya (list se hat gaya)') }
+      catch (e2) { alert(e2.message) }
+    }
   }
 
   // ── CATEGORIES ──
@@ -348,6 +381,9 @@ export default function App() {
 
   // ── CUSTOMERS ──
   const saveCust = async (d) => {
+    if (!d.name?.trim()) { setErr('Customer name is required'); return }
+    if (d.phone && !/^[0-9+\-\s]{7,15}$/.test(d.phone.trim())) { setErr('Phone number sahi nahi hai'); return }
+    setErr('')
     setSaving(true)
     try {
       if (d.id) await apiFetch(`customers/${d.id}`, { method: 'PUT', body: JSON.stringify(d) })
@@ -430,6 +466,9 @@ export default function App() {
 
   // ── INVOICES (EDIT + DELETE) ──
   const saveInvoice = async (d) => {
+    if (!d.id && !d.order_id && !d.customer_id) { setErr('Order ya customer select karein'); return }
+    if (!d.id && !d.order_id && !(Number(d.subtotal) > 0)) { setErr('Subtotal 0 se zyada hona chahiye'); return }
+    setErr('')
     setSaving(true)
     try {
       const selectedOrder = d.order_id ? orders.find(o => o.id === d.order_id) : null
@@ -583,6 +622,7 @@ export default function App() {
 
   // ── PORTAL USERS ──
   const saveAdminUser = async (d) => {
+    setErr('')
     setSaving(true)
     try {
       const isEdit = !!d.id
@@ -660,6 +700,12 @@ export default function App() {
 
   // ── PAYMENTS ──
   const savePayment = async (d) => {
+    if (!d.invoice_id) { setErr('Invoice select karein'); return }
+    if (!(Number(d.amount) > 0)) { setErr('Amount 0 se zyada hona chahiye'); return }
+    const inv = invoices.find(i => i.id === d.invoice_id)
+    const due = num(inv?.total_amount) - num(inv?.paid_amount)
+    if (inv && Number(d.amount) > due + 0.5) { setErr(`Amount baaki due (${cur(due)}) se zyada hai`); return }
+    setErr('')
     setSaving(true)
     try {
       await apiFetch('payments', { method: 'POST', body: JSON.stringify(d) })
@@ -853,7 +899,7 @@ export default function App() {
 // ─── DASHBOARD ────────────────────────────────────────────────
 function RenderDashboard({ orders, customers, invoices, inventory, lowStock }) {
   const totalSales = orders.reduce((s, o) => s + Number(o.total_amount || o.total || 0), 0)
-  const pendingDues = invoices.filter(i => i.payment_status !== 'paid').reduce((s, i) => s + Number(i.total_amount || 0), 0)
+  const pendingDues = invoices.reduce((s, i) => s + Math.max(0, Number(i.total_amount || 0) - Number(i.paid_amount || 0)), 0)
   const last7 = Array.from({ length: 7 }, (_, i) => {
     const d = new Date(); d.setDate(d.getDate() - i)
     const k = d.toLocaleDateString('en-IN')
@@ -1865,7 +1911,7 @@ function InvoiceDetail({ invoice, user, onPrint }) {
 
   useEffect(() => {
     const load = async () => {
-      const rows = await adminFetch('select', 'invoices', null, { qs: `select=*,customers(*),states(name),districts(name),blocks(name)&id=eq.${invoice.id}` })
+      const rows = await adminFetch('select', 'invoices', null, { qs: `select=*,customers(*),orders(order_number),states(name),districts(name),blocks(name)&id=eq.${invoice.id}` })
       const loaded = Array.isArray(rows) && rows[0] ? rows[0] : invoice
       setInv(loaded)
       const orderId = loaded.order_id || invoice.order_id
@@ -1909,7 +1955,7 @@ function InvoiceDetail({ invoice, user, onPrint }) {
             <div><span className="font-semibold">Invoice No:</span> {inv.invoice_number}</div>
             <div><span className="font-semibold">Date:</span> {fmtDate(inv.invoice_date||inv.created_at)}</div>
             {inv.due_date && <div><span className="font-semibold">Due Date:</span> {fmtDate(inv.due_date)}</div>}
-            {inv.order_id && <div><span className="font-semibold">Order Ref:</span> {inv.order_number || inv.order_id?.slice(0,8)}</div>}
+            {inv.order_id && <div><span className="font-semibold">Order Ref:</span> {inv.orders?.order_number || inv.order_id?.slice(0,8)}</div>}
           </div>
         </div>
       </div>
