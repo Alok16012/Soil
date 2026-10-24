@@ -5,6 +5,7 @@ import { supabase } from './lib/supabase'
 import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 
 // ─── API CONFIG ───────────────────────────────────────────────
+let sessionExpired = false
 const adminFetch = async (action, table, id, data = null, field = null, value = null) => {
   const { data: { session } } = await supabase.auth.getSession()
   const res = await fetch('/.netlify/functions/invoice-admin', {
@@ -13,6 +14,12 @@ const adminFetch = async (action, table, id, data = null, field = null, value = 
     body: JSON.stringify({ action, table, id, data, field, value }),
   })
   const json = await res.json()
+  if (res.status === 401) {
+    // Session was revoked or expired on the server: drop it locally and return to login
+    sessionExpired = true
+    await supabase.auth.signOut({ scope: 'local' })
+    throw new Error('Session expire ho gaya. Dobara login karein.')
+  }
   if (!res.ok || (json && !Array.isArray(json) && json.error)) {
     throw new Error(json?.error?.message || json?.error || json?.message || 'Database request failed')
   }
@@ -229,13 +236,26 @@ export default function App() {
     if (hash.get('type') === 'recovery') setRecovery(true)
     if (hash.get('error_code')) setErr(hash.get('error_code') === 'otp_expired' ? 'Reset link expire ho gaya. Dobara "Forgot password" karein.' : (hash.get('error_description') || 'Link invalid hai'))
     supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (session) {
+        // A stored session may have been revoked on the server (e.g. password reset); verify it
+        const { error } = await supabase.auth.getUser()
+        if (error && [401, 403].includes(error.status)) {
+          await supabase.auth.signOut({ scope: 'local' })
+          setErr('Session expire ho gaya. Dobara login karein.')
+          setLoading(false)
+          return
+        }
+      }
       const profile = await loadProfile(session)
       if (profile) setUser(profile)
-      else if (session) await supabase.auth.signOut()
+      else if (session) await supabase.auth.signOut({ scope: 'local' })
       setLoading(false)
     })
     const { data: sub } = supabase.auth.onAuthStateChange((event) => {
-      if (event === 'SIGNED_OUT') setUser(null)
+      if (event === 'SIGNED_OUT') {
+        setUser(null); setModal(null); setSaving(false)
+        if (sessionExpired) { sessionExpired = false; setErr('Session expire ho gaya. Dobara login karein.') }
+      }
       if (event === 'PASSWORD_RECOVERY') setRecovery(true)
     })
     return () => sub.subscription.unsubscribe()
@@ -262,14 +282,14 @@ export default function App() {
       if (error) { setErr(error.message === 'Invalid login credentials' ? 'Email ya password galat hai' : error.message); setSaving(false); return }
       const profile = await loadProfile(data.session)
       if (!profile) {
-        await supabase.auth.signOut()
+        await supabase.auth.signOut({ scope: 'local' })
         setErr('Account inactive hai ya profile nahi mila. Admin se contact karein.')
       } else { setUser(profile); setTab('dashboard'); setErr(''); setNotice('') }
     } catch { setErr('Login failed. Please try again.') }
     setSaving(false)
   }
 
-  const logout = async () => { await supabase.auth.signOut(); setUser(null) }
+  const logout = async () => { await supabase.auth.signOut({ scope: 'local' }); setUser(null) }
 
   const sendResetLink = async (email) => {
     if (!email?.trim()) { setErr('Email daalein'); return }
@@ -293,7 +313,7 @@ export default function App() {
     setRecovery(false); setSaving(false)
     window.history.replaceState(null, '', window.location.pathname)
     if (profile) { setUser(profile); setTab('dashboard') }
-    else { await supabase.auth.signOut(); setNotice('Password set ho gaya, lekin account inactive hai. Admin se contact karein.') }
+    else { await supabase.auth.signOut({ scope: 'local' }); setNotice('Password set ho gaya, lekin account inactive hai. Admin se contact karein.') }
   }
 
   const openModal = (type, data = null) => { setModal({ type, data }); setErr('') }
