@@ -51,7 +51,7 @@ const adminFetch = async (action, table, id, data = null, field = null, value = 
 const API_RESOURCES = {
   products: { table: 'products', select: '*', order: 'created_at.desc' },
   categories: { table: 'product_categories', select: '*', order: 'name.asc' },
-  customers: { table: 'customers', select: '*', order: 'created_at.desc' },
+  customers: { table: 'customers', select: '*,states(name),districts(name),blocks(name)', order: 'created_at.desc' },
   orders: { table: 'orders', select: '*,customers(name)', order: 'created_at.desc' },
   payments: { table: 'payments', select: '*,customers(name),invoices(invoice_number)', order: 'created_at.desc' },
   inventory: { table: 'inventory', select: '*,products(name,product_code,mrp,unit,is_active)', order: 'created_at.desc' },
@@ -157,6 +157,8 @@ const ROLE_LABEL = {
   block_admin: 'Block Admin', marketing_executive: 'Marketing Executive', accountant: 'Accountant',
   retailer: 'Retailer',
 }
+// Keep in sync with AREA_SCOPED_ROLES in the Netlify function and public.in_my_area()
+const AREA_SCOPED_ROLES = ['marketing_executive']
 const can = (user, mod) => (MODULES[user?.role] || []).includes(mod)
 
 // ─── STATUS BADGE ────────────────────────────────────────────
@@ -848,7 +850,7 @@ export default function App() {
               {err && <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-600 rounded-lg text-sm">{err}</div>}
               {modal.type === 'product' && <ProductForm data={modal.data} categories={categories} onSave={saveProduct} onCancel={closeModal} saving={saving} />}
               {modal.type === 'category' && <CatManager cats={categories} onSave={saveCat} onDel={delCat} onClose={closeModal} />}
-              {modal.type === 'customer' && <CustomerForm data={modal.data} states={states} districts={districts} blocks={blocks} onSave={saveCust} onCancel={closeModal} saving={saving} />}
+              {modal.type === 'customer' && <CustomerForm data={modal.data} user={user} states={states} districts={districts} blocks={blocks} onSave={saveCust} onCancel={closeModal} saving={saving} />}
               {modal.type === 'order' && <OrderForm data={modal.data} customers={customers} products={products} inventory={inventory} items={oItems} setItems={setOItems} onSave={saveOrder} onCancel={closeModal} saving={saving} />}
               {modal.type === 'orderDetail' && <OrderDetail order={modal.data} />}
               {modal.type === 'invoice' && <InvoiceForm data={modal.data} orders={orders} customers={customers} states={states} districts={districts} blocks={blocks} onSave={saveInvoice} onCancel={closeModal} saving={saving} />}
@@ -997,7 +999,7 @@ function RenderCustomers({ customers, openModal, askDel, delCust }) {
       <div className="bg-white rounded-xl border shadow-sm overflow-x-auto">
         <table className="w-full text-sm"><thead><tr className="bg-gray-50 text-xs text-gray-500 border-b">
           <th className="px-4 py-3 text-left">Code</th><th className="px-4 py-3 text-left">Name</th><th className="px-4 py-3 text-left">Phone</th>
-          <th className="px-4 py-3 text-left">GST No.</th><th className="px-4 py-3 text-left">Status</th><th className="px-4 py-3 text-left">Actions</th>
+          <th className="px-4 py-3 text-left">GST No.</th><th className="px-4 py-3 text-left">Area</th><th className="px-4 py-3 text-left">Status</th><th className="px-4 py-3 text-left">Actions</th>
         </tr></thead>
           <tbody>{customers.map(c => (
             <tr key={c.id} className="border-b hover:bg-gray-50">
@@ -1005,6 +1007,7 @@ function RenderCustomers({ customers, openModal, askDel, delCust }) {
               <td className="px-4 py-3"><p className="font-medium">{c.name}</p><p className="text-xs text-gray-400">{c.email}</p></td>
               <td className="px-4 py-3 text-gray-600">{c.phone}</td>
               <td className="px-4 py-3 text-xs text-gray-500">{c.gst_number}</td>
+              <td className="px-4 py-3 text-xs text-gray-500">{[c.districts?.name, c.blocks?.name].filter(Boolean).join(' → ') || c.states?.name || '-'}</td>
               <td className="px-4 py-3"><Badge s={c.is_active ? 'active' : 'inactive'} /></td>
               <td className="px-4 py-3"><Btns onEdit={() => openModal('customer', c)} onDel={() => askDel(`Delete "${c.name}"?`, () => delCust(c.id))} /></td>
             </tr>
@@ -1684,9 +1687,19 @@ function CatManager({ cats, onSave, onDel, onClose }) {
 }
 
 // ─── CUSTOMER FORM ────────────────────────────────────────────
-function CustomerForm({ data, states, districts, blocks, onSave, onCancel, saving }) {
-  const [f, setF] = useState(data || { name: '', phone: '', email: '', address: '', gst_number: '', credit_limit: 0, state_id: '', district_id: '', block_id: '', is_active: true })
+function CustomerForm({ data, user, states, districts, blocks, onSave, onCancel, saving }) {
+  // Area-scoped users (marketing executives) can only place customers inside their own area
+  const lock = AREA_SCOPED_ROLES.includes(user?.role)
+    ? { state_id: user.state_id || '', district_id: user.district_id || '', block_id: user.block_id || '' } : {}
+  const lockedKeys = Object.keys(lock).filter(k => lock[k])
+  const [f, setF] = useState(() => {
+    const base = data || { name: '', phone: '', email: '', address: '', gst_number: '', credit_limit: 0, state_id: '', district_id: '', block_id: '', is_active: true }
+    return { ...base, ...Object.fromEntries(lockedKeys.map(k => [k, lock[k]])) }
+  })
   const set = (k, v) => setF(p => ({ ...p, [k]: v }))
+  const isLocked = k => lockedKeys.includes(k)
+  const filtDist = districts.filter(d => d.state_id === f.state_id)
+  const filtBlocks = blocks.filter(b => b.district_id === f.district_id)
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-4">
@@ -1695,10 +1708,17 @@ function CustomerForm({ data, states, districts, blocks, onSave, onCancel, savin
         <FRow label="Email"><input className={inp} type="email" value={f.email} onChange={e => set('email', e.target.value)} /></FRow>
         <FRow label="GST Number"><input className={inp} value={f.gst_number} onChange={e => set('gst_number', e.target.value)} /></FRow>
         <FRow label="Credit Limit"><input className={inp} type="number" value={f.credit_limit} onChange={e => set('credit_limit', e.target.value)} /></FRow>
-        <FRow label="State"><select className={sel} value={f.state_id} onChange={e => set('state_id', e.target.value)}>
+        <FRow label="State"><select className={`${sel} disabled:bg-gray-100`} disabled={isLocked('state_id')} value={f.state_id || ''} onChange={e => setF(p => ({ ...p, state_id: e.target.value, district_id: '', block_id: '' }))}>
           <option value="">Select state...</option>{states.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
         </select></FRow>
+        <FRow label="District"><select className={`${sel} disabled:bg-gray-100`} disabled={isLocked('district_id')} value={f.district_id || ''} onChange={e => setF(p => ({ ...p, district_id: e.target.value, block_id: '' }))}>
+          <option value="">Select district...</option>{filtDist.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+        </select></FRow>
+        <FRow label="Block"><select className={`${sel} disabled:bg-gray-100`} disabled={isLocked('block_id')} value={f.block_id || ''} onChange={e => set('block_id', e.target.value)}>
+          <option value="">Select block...</option>{filtBlocks.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+        </select></FRow>
       </div>
+      {lockedKeys.length > 0 && <p className="text-xs text-gray-500 -mt-2">Aapke working area ke hisaab se location lock hai.</p>}
       <FRow label="Address"><textarea className={inp} rows={2} value={f.address} onChange={e => set('address', e.target.value)} /></FRow>
       <div className="flex justify-end gap-3 pt-2">
         <button onClick={onCancel} className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50">Cancel</button>

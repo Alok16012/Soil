@@ -10,6 +10,16 @@ const TABLES = [
 ]
 // Writes to these tables are limited to super/state admins
 const ADMIN_WRITE_TABLES = ['states', 'districts', 'blocks', 'gram_panchayats', 'villages', 'users', 'marketing_executives', 'sales_targets']
+// Tables each non-admin role may change (mirrors the modules the UI shows them)
+const ROLE_WRITE_TABLES = {
+  district_admin: ['products', 'product_categories', 'customers', 'orders', 'order_items', 'invoices', 'invoice_items', 'payments', 'inventory'],
+  block_admin: ['products', 'product_categories', 'customers', 'orders', 'order_items'],
+  marketing_executive: ['customers', 'orders', 'order_items'],
+  accountant: ['invoices', 'invoice_items', 'payments'],
+  retailer: ['orders', 'order_items'],
+}
+// Roles that only work inside their assigned area (keep in sync with public.in_my_area)
+const AREA_SCOPED_ROLES = ['marketing_executive']
 
 exports.handler = async (event) => {
   const headers = {
@@ -40,7 +50,7 @@ exports.handler = async (event) => {
   const meRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, { headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${token}` } })
   if (!meRes.ok) return reply(401, { error: 'Session expired. Please log in again.' })
   const me = await meRes.json()
-  const profRes = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${me.id}&select=id,role,is_active`, { headers: sbHeaders })
+  const profRes = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${me.id}&select=id,role,is_active,state_id,district_id,block_id`, { headers: sbHeaders })
   const caller = (await profRes.json())?.[0]
   if (!caller || !caller.is_active) return reply(403, { error: 'Account inactive or not found' })
   const isAdmin = ADMIN_ROLES.includes(caller.role)
@@ -51,6 +61,10 @@ exports.handler = async (event) => {
   // Portal users are only changed through the user actions below
   if (writes.includes(action) && table === 'users') return reply(403, { error: 'Use the user management actions' })
   if (writes.includes(action) && ADMIN_WRITE_TABLES.includes(table) && !isAdmin) return reply(403, { error: 'Only admins can change this data' })
+  if (!isAdmin && (writes.includes(action) || action === 'save_order')) {
+    const target = action === 'save_order' ? 'orders' : table
+    if (!(ROLE_WRITE_TABLES[caller.role] || []).includes(target)) return reply(403, { error: 'Aapke role ko ye badalne ki permission nahi hai' })
+  }
   const USER_ACTIONS = ['create_user', 'update_user', 'reset_password', 'delete_user', 'upload_photo']
   if (USER_ACTIONS.includes(action) && !isAdmin) return reply(403, { error: 'Only admins can manage users' })
   // A state admin may only manage non-admin users
@@ -58,6 +72,34 @@ exports.handler = async (event) => {
     return reply(403, { error: 'State admin cannot create or promote admin users' })
   }
   const enc = v => encodeURIComponent(v ?? '')
+  const scoped = AREA_SCOPED_ROLES.includes(caller.role)
+  // Ask PostgREST with the caller's own token, so row level security decides visibility
+  const visibleToCaller = async (tbl, rowId) => {
+    if (!rowId) return false
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${tbl}?id=eq.${enc(rowId)}&select=id`, { headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${token}` } })
+    return r.ok && (await r.json()).length > 0
+  }
+  // A scoped user's customers always sit inside their own area
+  const lockArea = row => {
+    const out = { ...row }
+    if (caller.state_id) out.state_id = caller.state_id
+    if (caller.district_id) out.district_id = caller.district_id
+    if (caller.block_id) out.block_id = caller.block_id
+    return out
+  }
+  if (scoped) {
+    if (action === 'delete_where') return reply(403, { error: 'Not allowed' })
+    if (['update', 'delete'].includes(action) && !(await visibleToCaller(table, id))) {
+      return reply(403, { error: 'Ye record aapke area me nahi hai' })
+    }
+    if (action === 'save_order') {
+      if (!(await visibleToCaller('customers', data?.order?.customer_id))) return reply(403, { error: 'Ye customer aapke area me nahi hai' })
+      if (id && !(await visibleToCaller('orders', id))) return reply(403, { error: 'Ye order aapke area me nahi hai' })
+    }
+    if (table === 'customers' && ['insert', 'update'].includes(action)) body.data = lockArea(data)
+    if (table === 'order_items' && action === 'insert') return reply(403, { error: 'Use save_order' })
+  }
+  if (table === 'customers' && action === 'insert') body.data = { ...body.data, created_by: caller.id }
   const loadTarget = async (userId) => {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${enc(userId)}&select=id,role`, { headers: sbHeaders })
     return (await r.json())?.[0]
@@ -159,11 +201,11 @@ exports.handler = async (event) => {
       res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${enc(id)}`, { method: 'DELETE', headers: sbHeaders })
       json = res.ok ? { success: true } : await res.json()
     } else if (action === 'update') {
-      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${enc(id)}`, { method: 'PATCH', headers: sbHeaders, body: JSON.stringify(data) })
+      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${enc(id)}`, { method: 'PATCH', headers: sbHeaders, body: JSON.stringify(body.data) })
       const text = await res.text()
       json = text ? JSON.parse(text) : { success: true }
     } else if (action === 'insert') {
-      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, { method: 'POST', headers: sbHeaders, body: JSON.stringify(data) })
+      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, { method: 'POST', headers: sbHeaders, body: JSON.stringify(body.data) })
       const text = await res.text()
       json = text ? JSON.parse(text) : { success: true }
     } else if (action === 'delete_where') {
