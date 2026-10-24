@@ -1,21 +1,31 @@
-const SUPABASE_URL = 'https://aqrczwhdvhxmvmquckid.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://ctraubzxdycwtzzpnhen.supabase.co'
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+
+const ADMIN_ROLES = ['super_admin', 'state_admin']
+const TABLES = [
+  'states', 'districts', 'blocks', 'gram_panchayats', 'villages',
+  'users', 'marketing_executives', 'sales_targets',
+  'product_categories', 'products', 'inventory', 'customers',
+  'orders', 'order_items', 'invoices', 'invoice_items', 'payments',
+]
+// Writes to these tables are limited to super/state admins
+const ADMIN_WRITE_TABLES = ['states', 'districts', 'blocks', 'gram_panchayats', 'villages', 'users', 'marketing_executives', 'sales_targets']
 
 exports.handler = async (event) => {
   const headers = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Content-Type': 'application/json',
   }
+  const reply = (statusCode, body) => ({ statusCode, headers, body: JSON.stringify(body) })
   if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers, body: '' }
-  if (event.httpMethod !== 'POST') return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) }
-  if (!SERVICE_KEY) return { statusCode: 500, headers, body: JSON.stringify({ error: 'SUPABASE_SERVICE_ROLE_KEY not set. Add it in Netlify → Site Settings → Environment Variables.' }) }
+  if (event.httpMethod !== 'POST') return reply(405, { error: 'Method not allowed' })
+  if (!SERVICE_KEY) return reply(500, { error: 'SUPABASE_SERVICE_ROLE_KEY not set. Add it in Netlify → Site Settings → Environment Variables.' })
 
   let body
-  try { body = JSON.parse(event.body || '{}') } catch { return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid JSON' }) } }
+  try { body = JSON.parse(event.body || '{}') } catch { return reply(400, { error: 'Invalid JSON' }) }
 
-  const { action, table, id, data } = body
   const sbHeaders = {
     'apikey': SERVICE_KEY,
     'Authorization': `Bearer ${SERVICE_KEY}`,
@@ -23,24 +33,38 @@ exports.handler = async (event) => {
     'Prefer': 'return=representation',
   }
 
+  // ── Verify the caller's Supabase session and load their profile ──
+  const authHeader = event.headers.authorization || event.headers.Authorization || ''
+  const token = authHeader.replace(/^Bearer\s+/i, '')
+  if (!token) return reply(401, { error: 'Not logged in' })
+  const meRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, { headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${token}` } })
+  if (!meRes.ok) return reply(401, { error: 'Session expired. Please log in again.' })
+  const me = await meRes.json()
+  const profRes = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${me.id}&select=id,role,is_active`, { headers: sbHeaders })
+  const caller = (await profRes.json())?.[0]
+  if (!caller || !caller.is_active) return reply(403, { error: 'Account inactive or not found' })
+  const isAdmin = ADMIN_ROLES.includes(caller.role)
+
+  const { action, table, id, data } = body
+  const writes = ['insert', 'update', 'delete', 'delete_where']
+  if (table && !TABLES.includes(table)) return reply(400, { error: `Unknown table: ${table}` })
+  if (writes.includes(action) && ADMIN_WRITE_TABLES.includes(table) && !isAdmin) return reply(403, { error: 'Only admins can change this data' })
+  if (['create_user', 'delete_user', 'upload_photo'].includes(action) && !isAdmin) return reply(403, { error: 'Only admins can manage users' })
+  if (caller.role === 'state_admin' && action === 'create_user' && ['super_admin', 'state_admin'].includes(data?.role)) {
+    return reply(403, { error: 'State admin cannot create admin users' })
+  }
+  const enc = v => encodeURIComponent(v ?? '')
+
   try {
     let res, json
     if (action === 'create_user') {
       const { email, password, first_name, last_name, phone, role } = data || {}
-      if (!email || !password || !first_name) {
-        return { statusCode: 400, headers, body: JSON.stringify({ error: 'Name, email and password are required' }) }
-      }
-      if (password.length < 6) {
-        return { statusCode: 400, headers, body: JSON.stringify({ error: 'Password must be at least 6 characters' }) }
-      }
+      if (!email || !password || !first_name) return reply(400, { error: 'Name, email and password are required' })
+      if (password.length < 6) return reply(400, { error: 'Password must be at least 6 characters' })
 
       const authRes = await fetch(`${SUPABASE_URL}/auth/v1/admin/users`, {
         method: 'POST',
-        headers: {
-          apikey: SERVICE_KEY,
-          Authorization: `Bearer ${SERVICE_KEY}`,
-          'Content-Type': 'application/json',
-        },
+        headers: sbHeaders,
         body: JSON.stringify({
           email: email.trim().toLowerCase(),
           password,
@@ -51,7 +75,7 @@ exports.handler = async (event) => {
       const authText = await authRes.text()
       const authJson = authText ? JSON.parse(authText) : {}
       if (!authRes.ok) {
-        return { statusCode: authRes.status, headers, body: JSON.stringify({ error: authJson.msg || authJson.message || authJson.error_description || 'Auth user creation failed' }) }
+        return reply(authRes.status, { error: authJson.msg || authJson.message || authJson.error_description || 'Auth user creation failed' })
       }
 
       const authUser = authJson.user || authJson
@@ -73,18 +97,21 @@ exports.handler = async (event) => {
       const profileText = await profileRes.text()
       const profileJson = profileText ? JSON.parse(profileText) : []
       if (!profileRes.ok) {
-        await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${authUser.id}`, {
-          method: 'DELETE',
-          headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}` },
-        })
-        return { statusCode: profileRes.status, headers, body: JSON.stringify({ error: profileJson.message || 'User profile creation failed' }) }
+        await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${authUser.id}`, { method: 'DELETE', headers: sbHeaders })
+        return reply(profileRes.status, { error: profileJson.message || 'User profile creation failed' })
       }
       json = { user: Array.isArray(profileJson) ? profileJson[0] : profileJson }
+    } else if (action === 'delete_user') {
+      if (id === caller.id) return reply(400, { error: 'You cannot delete your own account' })
+      // Deleting the auth user cascades to public.users and its profile rows
+      res = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${enc(id)}`, { method: 'DELETE', headers: sbHeaders })
+      json = res.ok ? { success: true } : await res.json()
+      if (!res.ok) return reply(res.status, { error: json.msg || json.message || 'User delete failed' })
     } else if (action === 'delete') {
-      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}`, { method: 'DELETE', headers: sbHeaders })
+      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${enc(id)}`, { method: 'DELETE', headers: sbHeaders })
       json = res.ok ? { success: true } : await res.json()
     } else if (action === 'update') {
-      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}`, { method: 'PATCH', headers: sbHeaders, body: JSON.stringify(data) })
+      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${enc(id)}`, { method: 'PATCH', headers: sbHeaders, body: JSON.stringify(data) })
       const text = await res.text()
       json = text ? JSON.parse(text) : { success: true }
     } else if (action === 'insert') {
@@ -93,42 +120,34 @@ exports.handler = async (event) => {
       json = text ? JSON.parse(text) : { success: true }
     } else if (action === 'delete_where') {
       const { field, value } = body
-      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${field}=eq.${value}`, { method: 'DELETE', headers: sbHeaders })
+      if (!/^[a-z_]+$/.test(field || '')) return reply(400, { error: 'Invalid field' })
+      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${field}=eq.${enc(value)}`, { method: 'DELETE', headers: sbHeaders })
       json = res.ok ? { success: true } : await res.json()
-    } else if (action === 'list') {
-      const { filter } = body
-      const qs = filter ? Object.entries(filter).map(([k, v]) => `${k}=eq.${v}`).join('&') : ''
-      const listHeaders = { ...sbHeaders, 'Prefer': 'return=representation' }
-      res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${qs}&order=created_at.desc`, { method: 'GET', headers: listHeaders })
-      const text = await res.text()
-      json = text ? JSON.parse(text) : []
     } else if (action === 'select') {
       const qs = (data && data.qs) ? data.qs : ''
       res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${qs}`, { method: 'GET', headers: sbHeaders })
       const text = await res.text()
       json = text ? JSON.parse(text) : []
     } else if (action === 'upload_photo') {
-      const { filename, contentType, base64data } = data
+      const { filename, contentType, base64data } = data || {}
       const bucket = 'executive-photos'
-      await fetch(`${SUPABASE_URL}/storage/v1/bucket`, {
-        method: 'POST',
-        headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: bucket, name: bucket, public: true })
-      })
-      const buf = Buffer.from(base64data, 'base64')
-      const upRes = await fetch(`${SUPABASE_URL}/storage/v1/object/${bucket}/${filename}`, {
+      const safeName = String(filename || 'photo').replace(/[^a-zA-Z0-9._-]/g, '_')
+      const buf = Buffer.from(base64data || '', 'base64')
+      const upRes = await fetch(`${SUPABASE_URL}/storage/v1/object/${bucket}/${safeName}`, {
         method: 'POST',
         headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}`, 'Content-Type': contentType || 'image/jpeg', 'x-upsert': 'true' },
-        body: buf
+        body: buf,
       })
       const upText = await upRes.text()
       const upJson = upText ? JSON.parse(upText) : {}
-      json = { url: `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${filename}`, ...upJson }
+      if (!upRes.ok) return reply(upRes.status, { error: upJson.message || 'Photo upload failed' })
+      json = { url: `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${safeName}`, ...upJson }
     } else {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Unknown action' }) }
+      return reply(400, { error: 'Unknown action' })
     }
-    return { statusCode: 200, headers, body: JSON.stringify(json) }
+    if (res && !res.ok) return reply(res.status, { error: json?.message || json?.error || 'Database request failed' })
+    return reply(200, json)
   } catch (e) {
-    return { statusCode: 500, headers, body: JSON.stringify({ error: e.message }) }
+    return reply(500, { error: e.message })
   }
 }

@@ -5,18 +5,11 @@ import { supabase } from './lib/supabase'
 import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 
 // ─── API CONFIG ───────────────────────────────────────────────
-const LOCAL_ADMIN_EMAIL = process.env.NEXT_PUBLIC_LOCAL_ADMIN_EMAIL || 'admin@soil.com'
-const LOCAL_ADMIN_PASSWORD = process.env.NEXT_PUBLIC_LOCAL_ADMIN_PASSWORD || 'Soil@123'
-const isAdminFallbackEnabled = () => typeof window !== 'undefined' && [
-  'localhost',
-  '127.0.0.1',
-  'soilappnet.netlify.app',
-].includes(window.location.hostname)
-
 const adminFetch = async (action, table, id, data = null, field = null, value = null) => {
+  const { data: { session } } = await supabase.auth.getSession()
   const res = await fetch('/.netlify/functions/invoice-admin', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(session ? { Authorization: `Bearer ${session.access_token}` } : {}) },
     body: JSON.stringify({ action, table, id, data, field, value }),
   })
   const json = await res.json()
@@ -126,10 +119,12 @@ const MODULES = {
   block_admin: ['dashboard','products','customers','orders'],
   marketing_executive: ['dashboard','customers','orders'],
   accountant: ['dashboard','invoices','payments','reports'],
+  retailer: ['dashboard','orders'],
 }
 const ROLE_LABEL = {
   super_admin: 'Super Admin', state_admin: 'State Admin', district_admin: 'District Admin',
   block_admin: 'Block Admin', marketing_executive: 'Marketing Executive', accountant: 'Accountant',
+  retailer: 'Retailer',
 }
 const can = (user, mod) => (MODULES[user?.role] || []).includes(mod)
 
@@ -161,7 +156,6 @@ const CHART_COLORS = ['#16a34a','#2563eb','#d97706','#dc2626','#7c3aed']
 export default function App() {
   const [user, setUser] = useState(null)
   const [loading, setLoading] = useState(true)
-  const [authMode, setAuthMode] = useState('login')
   const [tab, setTab] = useState('dashboard')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [searchQ, setSearchQ] = useState('')
@@ -217,12 +211,27 @@ export default function App() {
     } catch (e) { console.error('Load error:', e) }
   }, [])
 
+  // Load the portal profile for a Supabase session; null if missing or deactivated
+  const loadProfile = async (session) => {
+    if (!session?.user) return null
+    const { data: profile } = await supabase.from('users').select('*').eq('id', session.user.id).maybeSingle()
+    return profile?.is_active ? profile : null
+  }
+
   useEffect(() => {
-    const u = LS.get('soil_user')
-    if (u) setUser(u)
-    setLoading(false)
-    loadAll()
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      const profile = await loadProfile(session)
+      if (profile) setUser(profile)
+      else if (session) await supabase.auth.signOut()
+      setLoading(false)
+    })
+    const { data: sub } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') setUser(null)
+    })
+    return () => sub.subscription.unsubscribe()
   }, [])
+
+  useEffect(() => { if (user) loadAll() }, [user?.id])
 
   useEffect(() => {
     if (searchQ.length < 2) { setSearchRes([]); return }
@@ -238,38 +247,19 @@ export default function App() {
   const login = async (email, pass) => {
     setSaving(true)
     try {
-      if (isAdminFallbackEnabled() && email.trim().toLowerCase() === LOCAL_ADMIN_EMAIL.toLowerCase() && pass === LOCAL_ADMIN_PASSWORD) {
-        const localAdmin = {
-          id: 'local-super-admin',
-          first_name: 'Local',
-          last_name: 'Admin',
-          email: LOCAL_ADMIN_EMAIL,
-          role: 'super_admin',
-          is_active: true,
-        }
-        setUser(localAdmin); LS.set('soil_user', localAdmin); setTab('dashboard'); setErr(''); setSaving(false)
-        return
-      }
-      const res = await apiFetch('auth/login', { method: 'POST', body: JSON.stringify({ email, password: pass }) })
-      if (res?.user) {
-        setUser(res.user); LS.set('soil_user', res.user); setTab('dashboard'); setErr('')
-      } else { setErr(res?.message || res?.error || 'Invalid credentials') }
+      if (!email || !pass) { setErr('Email and password are required'); setSaving(false); return }
+      const { data, error } = await supabase.auth.signInWithPassword({ email: email.trim().toLowerCase(), password: pass })
+      if (error) { setErr(error.message === 'Invalid login credentials' ? 'Email ya password galat hai' : error.message); setSaving(false); return }
+      const profile = await loadProfile(data.session)
+      if (!profile) {
+        await supabase.auth.signOut()
+        setErr('Account inactive hai ya profile nahi mila. Admin se contact karein.')
+      } else { setUser(profile); setTab('dashboard'); setErr('') }
     } catch { setErr('Login failed. Please try again.') }
     setSaving(false)
   }
 
-  const signup = async (d) => {
-    setSaving(true)
-    try {
-      const res = await apiFetch('auth/signup', { method: 'POST', body: JSON.stringify(d) })
-      if (res?.user || res?.id) {
-        const u = res.user || res; setUser(u); LS.set('soil_user', u); setTab('dashboard'); setErr('')
-      } else { setErr(res?.message || res?.error || 'Signup failed') }
-    } catch { setErr('Signup failed') }
-    setSaving(false)
-  }
-
-  const logout = () => { setUser(null); LS.set('soil_user', null) }
+  const logout = async () => { await supabase.auth.signOut(); setUser(null) }
 
   const openModal = (type, data = null) => { setModal({ type, data }); setErr('') }
   const closeModal = () => { setModal(null); setErr(''); setSaving(false) }
@@ -394,7 +384,9 @@ export default function App() {
       const tax = orderSummary ? orderSummary.tax : subtotal * taxRate / 100
       const cgst = tax / 2
       const sgst = tax / 2
-      const { customer_name: _cn, gst_rate: _gst, tax_rate: _tr, ...rest } = d
+      const { customer_name: _cn, gst_rate: _gst, tax_rate: _tr, paid_amount: _pa, ...fields } = d
+      // drop joined objects (customers, states...) and server-managed columns before writing
+      const rest = cleanDbPayload(fields)
       const payload = {
         ...rest,
         subtotal,
@@ -577,7 +569,7 @@ export default function App() {
     setSaving(false)
   }
   const deletePortalUser = async (id) => {
-    try { await adminFetch('delete', 'users', id); await loadAll() } catch (e) { alert(e.message) }
+    try { await adminFetch('delete_user', null, id); await loadAll() } catch (e) { alert(e.message) }
   }
 
   // ── PAYMENTS ──
@@ -630,21 +622,10 @@ export default function App() {
           </div>
           <span className="inline-block mt-1 text-xs bg-green-100 text-green-700 px-3 py-0.5 rounded-full font-medium">Distribution Management System</span>
         </div>
-        <h2 className="text-lg font-semibold text-center mb-5 text-gray-700">{authMode === 'login' ? 'Sign In' : 'Create Account'}</h2>
+        <h2 className="text-lg font-semibold text-center mb-5 text-gray-700">Sign In</h2>
         {err && <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-600 rounded-lg text-sm">{err}</div>}
-        {authMode === 'login' ? <AuthLogin onLogin={login} loading={saving} /> : <AuthSignup onSignup={signup} loading={saving} />}
-        {authMode === 'login' && (
-          <div className="mt-4 rounded-lg border border-green-200 bg-green-50 p-3 text-xs text-green-800">
-            <p className="font-semibold">Local admin login</p>
-            <p>Email: {LOCAL_ADMIN_EMAIL}</p>
-            <p>Password: {LOCAL_ADMIN_PASSWORD}</p>
-          </div>
-        )}
-        <p className="text-center text-sm text-gray-500 mt-4">
-          {authMode === 'login'
-            ? <>No account? <button onClick={() => { setAuthMode('signup'); setErr('') }} className="text-green-600 font-semibold hover:underline">Sign Up</button></>
-            : <>Have account? <button onClick={() => { setAuthMode('login'); setErr('') }} className="text-green-600 font-semibold hover:underline">Sign In</button></>}
-        </p>
+        <AuthLogin onLogin={login} loading={saving} />
+        <p className="text-center text-xs text-gray-400 mt-4">Admin aur sabhi users ek hi login use karte hain. Naya account admin banata hai.</p>
       </div>
     </div>
   )
@@ -1428,22 +1409,6 @@ function AuthLogin({ onLogin, loading }) {
       <FRow label="Password" required><input className={inp} type="password" value={f.password} onChange={e => setF({ ...f, password: e.target.value })} onKeyDown={e => e.key === 'Enter' && onLogin(f.email, f.password)} placeholder="••••••••" /></FRow>
       <button onClick={() => onLogin(f.email, f.password)} disabled={loading} className="w-full py-2.5 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 disabled:opacity-60">
         {loading ? 'Signing in...' : 'Sign In'}
-      </button>
-    </div>
-  )
-}
-function AuthSignup({ onSignup, loading }) {
-  const [f, setF] = useState({ first_name: '', email: '', password: '', role: 'marketing_executive' })
-  return (
-    <div className="space-y-4">
-      <FRow label="Full Name" required><input className={inp} value={f.first_name} onChange={e => setF({ ...f, first_name: e.target.value })} /></FRow>
-      <FRow label="Email" required><input className={inp} type="email" value={f.email} onChange={e => setF({ ...f, email: e.target.value })} /></FRow>
-      <FRow label="Password" required><input className={inp} type="password" value={f.password} onChange={e => setF({ ...f, password: e.target.value })} /></FRow>
-      <FRow label="Role"><select className={sel} value={f.role} onChange={e => setF({ ...f, role: e.target.value })}>
-        {Object.entries(ROLE_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-      </select></FRow>
-      <button onClick={() => onSignup(f)} disabled={loading} className="w-full py-2.5 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 disabled:opacity-60">
-        {loading ? 'Creating...' : 'Create Account'}
       </button>
     </div>
   )
